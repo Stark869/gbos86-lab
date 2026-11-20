@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- gbos: select the generated device profile by ALSA card id (/proc/asound/cardN/id),
+     not by the card's long name. -->
+<AudioConfiguration>
+  <soundcard>PCH</soundcard>
+  <audio-config-dir>gbos-hda-pch</audio-config-dir>
+</AudioConfiguration>

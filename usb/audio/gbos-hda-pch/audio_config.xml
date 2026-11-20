@@ -1,0 +1,43 @@
+<?xml version='1.0' encoding='utf-8'?>
+<audio_config>
+	<!-- gbos: base template for legacy HDA card PCH. gen_config.sh remaps card ids,
+	     PCM endpoints, and jack names for non-PCH cards using detected device data.
+	     Section fields mirror Google's config because dras rejects missing fields.
+	     Mixer controls remain codec-specific; generated non-PCH routes are best effort. -->
+	<SoundCardName>hw:PCH</SoundCardName>
+	<HiFi>
+		<Speaker>
+			<PlaybackPCM>hw:PCH,0</PlaybackPCM>
+		</Speaker>
+		<Headphone>
+			<PlaybackPCM>hw:PCH,0</PlaybackPCM>
+			<JackDev>HDA Intel PCH Headphone Mic</JackDev>
+			<JackSwitch>2</JackSwitch>
+		</Headphone>
+		<InternalMic>
+			<CapturePCM>hw:PCH,0</CapturePCM>
+			<IntrinsicSensitivity>-2600</IntrinsicSensitivity>
+			<RampUpMs>100</RampUpMs>
+		</InternalMic>
+		<Mic>
+			<CapturePCM>hw:PCH,0</CapturePCM>
+			<CaptureMixerElem>Capture</CaptureMixerElem>
+			<JackDev>HDA Intel PCH Headphone Mic</JackDev>
+		</Mic>
+		<HDMI1>
+			<PlaybackPCM>hw:PCH,3</PlaybackPCM>
+			<JackDev>HDA Intel PCH HDMI/DP,pcm=3</JackDev>
+			<PlaybackChannels>2</PlaybackChannels>
+		</HDMI1>
+		<HDMI2>
+			<PlaybackPCM>hw:PCH,7</PlaybackPCM>
+			<JackDev>HDA Intel PCH HDMI/DP,pcm=7</JackDev>
+			<PlaybackChannels>2</PlaybackChannels>
+		</HDMI2>
+		<HDMI3>
+			<PlaybackPCM>hw:PCH,8</PlaybackPCM>
+			<JackDev>HDA Intel PCH HDMI/DP,pcm=8</JackDev>
+			<PlaybackChannels>2</PlaybackChannels>
+		</HDMI3>
+	</HiFi>
+</audio_config>
