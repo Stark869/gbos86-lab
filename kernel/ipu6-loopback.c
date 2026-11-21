@@ -3,15 +3,40 @@
 #include "../tools/camera_capture_probe.c"
 
 #include <math.h>
+#include <pthread.h>
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <stddef.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
-#define OUT_WIDTH 640
-#define OUT_HEIGHT 480
+#include "ipu6-channel.h"
+
+/*
+ * Output 1280x960 YUYV (4:3, the sensors' aspect). Colour is computed on a COL_WIDTH x
+ * COL_HEIGHT grid (one 4x4 mosaic window per point, as the 640x480 output was); the output
+ * takes its brightness detail from the green sites (half of all sites, a checkerboard on both
+ * sensors) at full output resolution. See convert_bayer_yuyv.
+ */
+/*
+ * 1920x1080 since 2026-11-20 (boot-18). Google's camera app creates a CameraX video use case, and
+ * with no encoder profiles for these cameras CameraX only accepts its own quality sizes: SD
+ * 720x480/640x480, HD 1280x720, FHD 1920x1080, QHD 2560x1440, UHD 3840x2160. With 1280x960 as the
+ * only size no quality matched: "Required value was null" in the app's MainViewModel (boot-18),
+ * the silent stall of boot-17. 640x480 (SD) worked on boot-15. Every quality of 1280 or wider is
+ * 16:9, so the 4:3 sensors are cropped (sensor_crop). -DOUT_WIDTH/-DOUT_HEIGHT: the CAMERA_SIZE
+ * builds (1280x720, 640x480).
+ */
+#ifndef OUT_WIDTH
+#define OUT_WIDTH 1920
+#define OUT_HEIGHT 1080
+#endif
+#define COL_WIDTH (OUT_WIDTH / 2)
+#define COL_HEIGHT (OUT_HEIGHT / 2)
 #define OUT_FOURCC V4L2_PIX_FMT_YUYV
 #define OUT_FRAME_BYTES ((size_t)OUT_WIDTH * OUT_HEIGHT * 2)
 #define BLACK_LEVEL 64
@@ -25,6 +50,24 @@
 #define AE_DEADBAND 0.15
 #define AE_MAX_STEP 1.6
 #define AE_INTERVAL 3	/* frames between updates; sensor settings lag about two frames */
+/*
+ * Fast phase when an app starts streaming (ae_wake): the idle state's exposure is often far off.
+ * Boot-20: on every rear session the first frames were ~2x over the target (green mean 345 vs
+ * 174 just before, at 11.6x gain), and with 1.6x steps every 3 frames the picture stayed blown out
+ * for over a second (the raw dump 1 s in). For AE_FAST_FRAMES frames AE updates every
+ * AE_FAST_INTERVAL frames (the settings' lag) with steps of up to AE_FAST_MAX_STEP.
+ */
+#define AE_FAST_FRAMES 12
+#define AE_FAST_INTERVAL 2
+#define AE_FAST_MAX_STEP 4.0
+/*
+ * A blown-out picture hides how far over it is (clipped sites stop at the sensor's maximum, so the
+ * mean under-reports). In the fast phase, when more than AE_FAST_CLIP_FRACTION of the green samples
+ * are clipped, exposure at least halves. Normal operation is unchanged (a lamp in the picture must
+ * not darken the rest).
+ */
+#define AE_FAST_CLIP_FRACTION 0.05
+static double ae_clip_fraction;	/* green samples at >= 95% of the clip level (last statistics) */
 /*
  * Exposure program limits from the module's Windows tuning (OV5678_0BF501T3_TGL.aiqb, AE
  * exposure-program record 261): analogue gain at most 15.5x (also the top of its black-level
@@ -81,9 +124,25 @@ static const unsigned char ov5675_rgbir[4][4] = {
 	{ 2, 1, 0, 1 },
 };
 
+/* Per-site channel masks and the per-channel site count of any 4x4 window (rgb_linear_at). */
+static uint32_t cfa_mask[4][4][4];
+static unsigned int cfa_count[4];
+
+static void cfa_changed(void)
+{
+	memset(cfa_count, 0, sizeof(cfa_count));
+	for (int y = 0; y < 4; y++)
+		for (int x = 0; x < 4; x++) {
+			for (int c = 0; c < 4; c++)
+				cfa_mask[y][x][c] = cfa[y][x] == c ? ~0u : 0;
+			cfa_count[cfa[y][x]]++;
+		}
+}
+
 static void set_rgbir_pattern(void)
 {
 	memcpy(cfa, ov5675_rgbir, sizeof(cfa));
+	cfa_changed();
 }
 
 /* Plain 2x2 Bayer from the media bus code, expanded to the 4x4 table. */
@@ -101,6 +160,7 @@ static int set_bayer_pattern(__u32 code)
 			for (int y = 0; y < 4; y++)
 				for (int x = 0; x < 4; x++)
 					cfa[y][x] = patterns[i].cfa[y & 1][x & 1];
+			cfa_changed();
 			return 0;
 		}
 	return -1;
@@ -172,6 +232,42 @@ static int cfa_has_ir_sites(void)
 	return 0;
 }
 
+/* Raw code (10 bits, with black level) to linear 0..LINEAR_MAX. */
+static uint16_t raw_lin_lut[1024];
+
+static void init_raw_lut(void)
+{
+	static int ready;
+
+	if (ready)
+		return;
+	for (unsigned int code = 0; code < 1024; code++) {
+		unsigned int value = code > BLACK_LEVEL ? code - BLACK_LEVEL : 0;
+		raw_lin_lut[code] = (uint16_t)((value * LINEAR_MAX + RAW_RANGE / 2) / RAW_RANGE);
+	}
+	ready = 1;
+}
+
+/*
+ * The sensor area the picture shows: centred, with the output's aspect ratio (all of a 4:3
+ * sensor for 4:3 output; a 16:9 band for 16:9 output). Set for each frame by sensor_crop().
+ */
+static unsigned int crop_x, crop_y, crop_w = 1, crop_h = 1;
+
+static void sensor_crop(unsigned int width, unsigned int height)
+{
+	crop_x = crop_y = 0;
+	crop_w = width;
+	crop_h = height;
+	if ((uint64_t)width * OUT_HEIGHT > (uint64_t)height * OUT_WIDTH) {
+		crop_w = (unsigned int)((uint64_t)height * OUT_WIDTH / OUT_HEIGHT) & ~1u;
+		crop_x = ((width - crop_w) / 2) & ~1u;
+	} else if ((uint64_t)width * OUT_HEIGHT < (uint64_t)height * OUT_WIDTH) {
+		crop_h = (unsigned int)((uint64_t)width * OUT_HEIGHT / OUT_WIDTH) & ~1u;
+		crop_y = ((height - crop_h) / 2) & ~1u;
+	}
+}
+
 static unsigned int raw_at(const uint16_t *raw, unsigned int width,
 			   unsigned int height, unsigned int stride,
 			   int x, int y)
@@ -180,9 +276,8 @@ static unsigned int raw_at(const uint16_t *raw, unsigned int width,
 	if (y < 0) y = 0;
 	if ((unsigned int)x >= width) x = (int)width - 1;
 	if ((unsigned int)y >= height) y = (int)height - 1;
-	unsigned int value = raw[(size_t)y * (stride / 2) + (unsigned int)x] & 1023;
-	value = value > BLACK_LEVEL ? value - BLACK_LEVEL : 0;
-	return (value * LINEAR_MAX + RAW_RANGE / 2) / RAW_RANGE;
+	init_raw_lut();
+	return raw_lin_lut[raw[(size_t)y * (stride / 2) + (unsigned int)x] & 1023];
 }
 
 /*
@@ -211,7 +306,16 @@ static unsigned int raw_at(const uint16_t *raw, unsigned int width,
  * Plain Bayer has no IR sites: IR = 0, n = 0.
  */
 static int ir_visible_q12 = 410;		/* 0.10 */
-static int nir_keep_q12[3] = { 0, 0, 1638 };	/* R, G: k = 1; B: k = 0.60 */
+/*
+ * 2026-11-20 (boot-15): k_B = 0.75, not 0.60. The 0.60 fit assumed daylight sits on the locus.
+ * Boot-14 showed real lights 0.10-0.14 off it on the green side, and at 0.60 the objects that
+ * reflect much NIR came out too blue in boot-15's window light: a dark green T-shirt teal, a
+ * dark teal wall navy (host simulation: a true k_B of 0.75 under the 0.60 model gives exactly
+ * that teal). At 0.75 boot-12's daylight frames sit on the locus (0.00-0.03; at 0.60 they were
+ * 0.04 on the magenta side), boot-8's 0.07 on the green side, within the green-side zone.
+ */
+static int nir_keep_q12[3] = { 0, 0, 1024 };	/* R, G: k = 1; B: k = 0.75 */
+
 
 static int nir_estimate(int ir, int green)
 {
@@ -384,9 +488,19 @@ static double wb_locus_distance, wb_locus_band = WB_LOCUS_BAND, wb_nir_ratio;
  */
 static double wb_locus_green_band = 0.18;	/* 0: the plain band (host-test negative control) */
 #define WB_LOCUS_ACCEPT_MAGENTA 2.0
-#define WB_REGIONS_X 8
-#define WB_REGIONS_Y 6
+#define WB_REGIONS_X 16
+#define WB_REGIONS_Y 12
 #define WB_REGIONS_MIN_FRACTION 0.25	/* of the regions with signal */
+/*
+ * 2026-11-21 (calibration shot, boot-23 vs Windows): the white point is taken from the brightest
+ * of the regions a light could have lit, as white surfaces (paper, walls, a flag's white) are the
+ * brightest things in most rooms: each accepted region weighs (its green / the brightest
+ * accepted region's green) ^ WB_BRIGHT_POWER. With every region weighing its brightness once
+ * (the old rule) a large saturated object nearby dragged the white point: a red flag in the sun
+ * made the white shield light blue (white point R/G 0.63 for a white at 0.46). Regions are 16x12
+ * (were 8x6) so a white patch is less often averaged together with its surroundings.
+ */
+static double wb_bright_power = 3.0;	/* 0: plain average (host-test negative control) */
 static double wb_locus_side;		/* > 0 green side, < 0 magenta side (last measurement) */
 static int wb_regions_used, wb_regions_valid;
 
@@ -489,8 +603,9 @@ struct lsc_entry {
 static struct lsc_entry lsc_table[LSC_MAX_ILL];
 static int lsc_count, lsc_active, lsc_pick[2] = { -1, -1 };
 static double lsc_weight, lsc_strength = 1.0, sensor_total_gain = 1.0;
-static uint16_t lsc_map[3][OUT_HEIGHT][OUT_WIDTH];
-static struct { int pick[2]; double weight, strength; unsigned int w, h; } lsc_built = { { -2, -2 }, 0, 0, 0, 0 };
+static uint16_t lsc_map[3][COL_HEIGHT][COL_WIDTH];	/* per colour-grid point */
+static struct { int pick[2]; double weight, strength; unsigned int w, h, crop_x, crop_y; } lsc_built = { { -2, -2 }, 0, 0, 0, 0, 0, 0 };
+static unsigned int lsc_generation;	/* counts lsc_map rebuilds (the GPU copy follows it) */
 
 static int load_lsc_table(const char *path)
 {
@@ -568,14 +683,15 @@ static void update_lsc(double rg, double bg, unsigned int width, unsigned int he
 	lsc_strength = lsc_strength_for_gain(sensor_total_gain);
 	lsc_active = 1;
 	if (lsc_built.pick[0] == a && lsc_built.pick[1] == b && fabs(lsc_built.weight - wa) < 0.05 &&
+	    lsc_built.crop_y == crop_y && lsc_built.crop_x == crop_x &&
 	    fabs(lsc_built.strength - lsc_strength) < 0.05 && lsc_built.w == width && lsc_built.h == height)
 		return;
 	const struct lsc_entry *ea = &lsc_table[a], *eb = &lsc_table[b];
-	for (int oy = 0; oy < OUT_HEIGHT; oy++) {
-		double sy = ((oy * (double)height) / OUT_HEIGHT + 1.0) / height;	/* window centre, 0..1 */
+	for (int oy = 0; oy < COL_HEIGHT; oy++) {
+		double sy = (crop_y + (oy * (double)crop_h) / COL_HEIGHT + 1.0) / height;	/* window centre, 0..1 */
 		double gy = sy * (ea->gh - 1);
-		for (int ox = 0; ox < OUT_WIDTH; ox++) {
-			double sx = ((ox * (double)width) / OUT_WIDTH + 1.0) / width;
+		for (int ox = 0; ox < COL_WIDTH; ox++) {
+			double sx = (crop_x + (ox * (double)crop_w) / COL_WIDTH + 1.0) / width;
 			double gx = sx * (ea->gw - 1);
 			for (int c = 0; c < 3; c++) {
 				double g = wa * lsc_grid_at(ea, c, gx, gy) + (1 - wa) * lsc_grid_at(eb, c, gx, gy);
@@ -587,6 +703,8 @@ static void update_lsc(double rg, double bg, unsigned int width, unsigned int he
 	lsc_built.pick[0] = a; lsc_built.pick[1] = b;
 	lsc_built.weight = wa; lsc_built.strength = lsc_strength;
 	lsc_built.w = width; lsc_built.h = height;
+	lsc_built.crop_x = crop_x; lsc_built.crop_y = crop_y;
+	lsc_generation++;
 }
 
 static void calculate_white_balance(const uint16_t *raw, unsigned int width,
@@ -597,10 +715,13 @@ static void calculate_white_balance(const uint16_t *raw, unsigned int width,
 	double sum[4] = { 0 };
 	static double rsum[WB_REGIONS_Y][WB_REGIONS_X][4];
 	static uint64_t rcount[WB_REGIONS_Y][WB_REGIONS_X][4];
+
 	int shaded = lsc_active && lsc_built.w == width && lsc_built.h == height && cfa_has_ir_sites();
 	static unsigned int ghist[1024];
 	unsigned int gmax = 0, gnear = 0, gcount = 0;
 	double mean[4];
+
+	sensor_crop(width, height);
 
 	/* Sensor clip level: a flat top among this frame's sampled green sites (see raw_clip). */
 	memset(ghist, 0, sizeof(ghist));
@@ -631,10 +752,15 @@ static void calculate_white_balance(const uint16_t *raw, unsigned int width,
 	 * and its colour is reported good, so it is left as it was (see HANDOFF 2026-11-19).
 	 */
 	unsigned int tile_limit = raw_clip - (raw_clip - BLACK_LEVEL) / 20;	/* 95% of the range */
+	unsigned int clipped = 0;
+	for (unsigned int v = tile_limit; v < 1024; v++)
+		clipped += ghist[v];
+	ae_clip_fraction = gcount ? (double)clipped / gcount : 0;
 	memset(rsum, 0, sizeof(rsum));
 	memset(rcount, 0, sizeof(rcount));
-	for (unsigned int y = 0; y < height; y += 16) {
-		for (unsigned int x = 0; x < width; x += 16) {
+	/* Statistics (white balance, AE) over what the picture shows: the crop. */
+	for (unsigned int y = crop_y; y < crop_y + crop_h; y += 16) {
+		for (unsigned int x = crop_x; x < crop_x + crop_w; x += 16) {
 			uint64_t tsum[4] = { 0 }, tcount[4] = { 0 };
 			unsigned int tpeak = 0;
 			for (unsigned int dy = 0; dy < 4 && y + dy < height; dy++) {
@@ -655,14 +781,14 @@ static void calculate_white_balance(const uint16_t *raw, unsigned int width,
 				continue;
 			double shade[4] = { 1, 1, 1, 1 };
 			if (shaded) {
-				unsigned int ox = (unsigned int)(((uint64_t)x * OUT_WIDTH) / width);
-				unsigned int oy = (unsigned int)(((uint64_t)y * OUT_HEIGHT) / height);
+				unsigned int ox = (unsigned int)(((uint64_t)(x - crop_x) * COL_WIDTH) / crop_w);
+				unsigned int oy = (unsigned int)(((uint64_t)(y - crop_y) * COL_HEIGHT) / crop_h);
 				shade[0] = lsc_map[0][oy][ox] / 4096.0;
 				shade[1] = shade[CFA_IR] = lsc_map[1][oy][ox] / 4096.0;
 				shade[2] = lsc_map[2][oy][ox] / 4096.0;
 			}
-			unsigned int rx = (unsigned int)((uint64_t)x * WB_REGIONS_X / width);
-			unsigned int ry = (unsigned int)((uint64_t)y * WB_REGIONS_Y / height);
+			unsigned int rx = (unsigned int)((uint64_t)(x - crop_x) * WB_REGIONS_X / crop_w);
+			unsigned int ry = (unsigned int)((uint64_t)(y - crop_y) * WB_REGIONS_Y / crop_h);
 			for (int channel = 0; channel < 4; channel++) {
 				sum[channel] += tsum[channel] * shade[channel];
 				count[channel] += tcount[channel];
@@ -708,7 +834,9 @@ static void calculate_white_balance(const uint16_t *raw, unsigned int width,
 		/* Front: measure on the regions a light could have lit (see wb_locus_green_band). */
 		wb_regions_used = wb_regions_valid = 0;
 		if (cfa_has_ir_sites() && ccm_count >= 2 && wb_locus_green_band > 0) {
-			double acc[3] = { 0 };
+			double acc[3] = { 0 }, gmax = 0;
+			static double accepted[WB_REGIONS_Y * WB_REGIONS_X][3];
+			int na = 0;
 			update_locus_band();
 			for (int ry = 0; ry < WB_REGIONS_Y; ry++)
 				for (int rx = 0; rx < WB_REGIONS_X; rx++) {
@@ -724,9 +852,15 @@ static void calculate_white_balance(const uint16_t *raw, unsigned int width,
 					if (!locus_accepts(m[0] / m[1], m[2] / m[1]))
 						continue;
 					wb_regions_used++;
-					for (int c = 0; c < 3; c++)	/* brighter regions weigh more */
-						acc[c] += m[c];
+					memcpy(accepted[na++], m, sizeof(accepted[0]));
+					if (m[1] > gmax)
+						gmax = m[1];
 				}
+			for (int i = 0; i < na; i++) {	/* the brightest regions weigh most */
+				double w = wb_bright_power > 0 ? pow(accepted[i][1] / gmax, wb_bright_power) : 1.0;
+				for (int c = 0; c < 3; c++)
+					acc[c] += w * accepted[i][c];
+			}
 			if (wb_regions_used > 0 &&
 			    wb_regions_used >= WB_REGIONS_MIN_FRACTION * wb_regions_valid) {
 				rg = acc[0] / acc[1];
@@ -837,11 +971,25 @@ static int chroma_radius = 2;		/* colour averaged over (2r+1)^2 output pixels; 0
 #define HIGH_GAIN_X 8.0
 #define EDGE_DESATURATION 0.7	/* most colour removed at the strongest edges */
 
+/*
+ * chroma_radius is in cells of a 640-wide colour grid (about 4 sensor pixels each), where it was
+ * tuned (boot-11..15). The grid is COL_WIDTH wide, so scale it to cover the same sensor area:
+ * 3 cells at 960 (1920x1080 output), 1 at 320 (640x480). Boot-19: unscaled at 960, the green and
+ * magenta speckle came back.
+ */
+static int chroma_radius_scaled(void)
+{
+	if (chroma_radius <= 0)
+		return 0;
+	int r = (chroma_radius * COL_WIDTH + 320) / 640;
+	return r < 1 ? 1 : r;
+}
+
 static int chroma_radius_for_gain(double gain)
 {
 	if (chroma_radius <= 0)
 		return 0;
-	return chroma_radius + (gain > HIGH_GAIN_X) + (gain > 2 * HIGH_GAIN_X);
+	return chroma_radius_scaled() + (gain > HIGH_GAIN_X) + (gain > 2 * HIGH_GAIN_X);
 }
 
 static int tnr_threshold_for_gain(double gain)
@@ -881,11 +1029,18 @@ static void soft_clip_rgb(int c[3])
  */
 static int output_rotate180;
 
-static int16_t plane_y[OUT_HEIGHT][OUT_WIDTH], plane_u[OUT_HEIGHT][OUT_WIDTH],
-	plane_v[OUT_HEIGHT][OUT_WIDTH], plane_tmp[OUT_HEIGHT][OUT_WIDTH];
-/* Linear (pre-gamma) R, G, B per output pixel, and their neighbourhood averages. */
-static int16_t lin_plane[3][OUT_HEIGHT][OUT_WIDTH], lin_avg[3][OUT_HEIGHT][OUT_WIDTH];
+/* Output luma (full resolution, unrotated). */
+static int16_t plane_y[OUT_HEIGHT][OUT_WIDTH];
 static unsigned char tnr_previous[OUT_HEIGHT][OUT_WIDTH];
+/*
+ * Colour grid: linear (pre-gamma) R, G, B per point, their neighbourhood averages (then the
+ * final colour), and the window's raw green (linear, no lens shading) for the detail pass.
+ */
+static int16_t plane_tmp[COL_HEIGHT][COL_WIDTH];
+static int16_t lin_plane[3][COL_HEIGHT][COL_WIDTH], lin_avg[3][COL_HEIGHT][COL_WIDTH];
+static uint16_t col_green[COL_HEIGHT][COL_WIDTH];
+/* Colour grid in Y', U, V (gamma-encoded, BT.601 full range): the 640x480 picture as before. */
+static int16_t col_y[COL_HEIGHT][COL_WIDTH], col_u[COL_HEIGHT][COL_WIDTH], col_v[COL_HEIGHT][COL_WIDTH];
 static int tnr_have_previous;
 
 /* Forget the previous frame (start, or resuming after idle): no blending with stale content. */
@@ -894,38 +1049,78 @@ static void tnr_reset(void)
 	tnr_have_previous = 0;
 }
 
-static void box_filter_plane(int16_t plane[OUT_HEIGHT][OUT_WIDTH], int r)
+static void box_filter_plane(int16_t plane[COL_HEIGHT][COL_WIDTH], int r)
 {
 	/* Separable running-sum box filter, edges clamped. */
-	for (int y = 0; y < OUT_HEIGHT; y++) {
+	for (int y = 0; y < COL_HEIGHT; y++) {
 		int sum = 0;
 		for (int k = -r; k <= r; k++)
-			sum += plane[y][k < 0 ? 0 : (k >= OUT_WIDTH ? OUT_WIDTH - 1 : k)];
-		for (int x = 0; x < OUT_WIDTH; x++) {
+			sum += plane[y][k < 0 ? 0 : (k >= COL_WIDTH ? COL_WIDTH - 1 : k)];
+		for (int x = 0; x < COL_WIDTH; x++) {
 			plane_tmp[y][x] = (int16_t)(sum / (2 * r + 1));
 			int out_x = x - r, in_x = x + r + 1;
 			sum -= plane[y][out_x < 0 ? 0 : out_x];
-			sum += plane[y][in_x >= OUT_WIDTH ? OUT_WIDTH - 1 : in_x];
+			sum += plane[y][in_x >= COL_WIDTH ? COL_WIDTH - 1 : in_x];
 		}
 	}
-	for (int x = 0; x < OUT_WIDTH; x++) {
+	for (int x = 0; x < COL_WIDTH; x++) {
 		int sum = 0;
 		for (int k = -r; k <= r; k++)
-			sum += plane_tmp[k < 0 ? 0 : (k >= OUT_HEIGHT ? OUT_HEIGHT - 1 : k)][x];
-		for (int y = 0; y < OUT_HEIGHT; y++) {
+			sum += plane_tmp[k < 0 ? 0 : (k >= COL_HEIGHT ? COL_HEIGHT - 1 : k)][x];
+		for (int y = 0; y < COL_HEIGHT; y++) {
 			plane[y][x] = (int16_t)(sum / (2 * r + 1));
 			int out_y = y - r, in_y = y + r + 1;
 			sum -= plane_tmp[out_y < 0 ? 0 : out_y][x];
-			sum += plane_tmp[in_y >= OUT_HEIGHT ? OUT_HEIGHT - 1 : in_y][x];
+			sum += plane_tmp[in_y >= COL_HEIGHT ? COL_HEIGHT - 1 : in_y][x];
 		}
 	}
+}
+
+/*
+ * Front (RGB-IR) colour reliability. Boot-15 (2026-11-20, selfie by a sunny window, NIR 0.7-0.9
+ * of green over the frame): a dark green T-shirt came out teal, a dark teal wall navy, skin
+ * pinkish, while the white ceiling was nearly neutral. Dyed fabric and paint reflect little
+ * visible light but much NIR, so in their windows NIR is several times the visible green, and
+ * any error in a channel's NIR response (the blue term is our fit, +/-0.1) is multiplied by
+ * that ratio. White balance absorbs the error at the frame's own NIR level, so what is left
+ * grows with the window's NIR ratio minus the frame's (wb_nir_ratio). The blue term is now refit
+ * (k_B above); as a safety net, past NIR_CHROMA_FREE above the frame's ratio the window's colour
+ * is faded towards its luminance: half kept at NIR_CHROMA_HALF more.
+ *
+ * And where the window's 8 green sites disagree strongly (stripes, sharp edges: the window
+ * blinds), its 2 R and 2 B sites see other parts of the pattern than the greens: green and
+ * magenta fringes at any gain. Past HF_CHROMA_START (green contrast (max-min)/(max+min)), colour
+ * fades, to HF_CHROMA_MIN at HF_CHROMA_FULL.
+ */
+static int chroma_guard_strongest = 1;	/* 0: NIR relative to green, as before (host-test control) */
+#define NIR_CHROMA_FREE 1.5
+#define NIR_CHROMA_HALF 3.0
+#define HF_CHROMA_START 0.25
+#define HF_CHROMA_FULL 0.75
+#define HF_CHROMA_MIN 0.15
+static int chroma_guard = 1;	/* 0: off (host-test negative control) */
+
+/* Colour kept (0..1) for a window: NIR ratio rho (NIR / visible green), green contrast hf. */
+static double chroma_keep_for(double rho, double hf)
+{
+	double keep = 1.0, d = rho - wb_nir_ratio - NIR_CHROMA_FREE;
+
+	if (d > 0)
+		keep = 1.0 / (1.0 + d / NIR_CHROMA_HALF);
+	if (hf > HF_CHROMA_START) {
+		double t = (hf - HF_CHROMA_START) / (HF_CHROMA_FULL - HF_CHROMA_START);
+		double k = 1.0 - (1.0 - HF_CHROMA_MIN) * (t > 1 ? 1 : t);
+		if (k < keep)
+			keep = k;
+	}
+	return keep;
 }
 
 /* Linear-light R, G, B (0..LINEAR_MAX) of the 4x4 window at x, y. */
 static void rgb_linear_at(const uint16_t *raw, unsigned int width, unsigned int height,
 			  unsigned int stride, const unsigned int gain_q12[3],
 			  unsigned int x, unsigned int y, const unsigned int *shading_q12,
-			  int rgb[3])
+			  int rgb[3], unsigned int *green_out)
 {
 	/*
 	 * A 4x4 window holds every site of the 4x4 mosaic exactly once (2 R, 2 B, 8 G,
@@ -933,21 +1128,33 @@ static void rgb_linear_at(const uint16_t *raw, unsigned int width, unsigned int 
 	 * red or blue read as zero in drifting patches: the cyan/yellow grid.
 	 * The window is shifted inward at the frame edges so it is always complete.
 	 */
-	unsigned int sum[4] = { 0 }, n[4] = { 0 };
+	unsigned int sum[4], n[4];
 	unsigned int x0 = x > 0 ? x - 1 : 0, y0 = y > 0 ? y - 1 : 0;
 
 	if (x0 > width - 4) x0 = width - 4;
 	if (y0 > height - 4) y0 = height - 4;
-	unsigned int peak = 0;
-	for (unsigned int sy = y0; sy < y0 + 4; sy++)
+	unsigned int peak = 0, gmin = ~0u, gmax = 0, s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+	init_raw_lut();
+	/*
+	 * Masked sums in registers: any 4x4 window holds each site of the mosaic once, so the
+	 * per-channel counts are fixed (cfa_count); the channel of each site comes from its phase.
+	 */
+	for (unsigned int sy = y0; sy < y0 + 4; sy++) {
+		const uint16_t *row = raw + (size_t)sy * (stride / 2);	/* the window is inside the frame */
 		for (unsigned int sx = x0; sx < x0 + 4; sx++) {
-			int channel = channel_at(sx, sy);
-			unsigned int v = raw_at(raw, width, height, stride, (int)sx, (int)sy);
-			sum[channel] += v;
-			n[channel]++;
-			if (v > peak)
-				peak = v;
+			const uint32_t *m = cfa_mask[sy & 3][sx & 3];
+			unsigned int v = raw_lin_lut[row[sx] & 1023];
+			s0 += v & m[0]; s1 += v & m[1]; s2 += v & m[2]; s3 += v & m[3];
+			peak = v > peak ? v : peak;
+			unsigned int lo = v | ~m[1], hi = v & m[1];
+			gmin = lo < gmin ? lo : gmin;
+			gmax = hi > gmax ? hi : gmax;
 		}
+	}
+	sum[0] = s0; sum[1] = s1; sum[2] = s2; sum[3] = s3;
+	memcpy(n, cfa_count, sizeof(n));
+	if (green_out)
+		*green_out = n[1] ? sum[1] / n[1] : 0;
 	/*
 	 * Lens shading (shading_q12: R, G, B gains for this position; NULL = none). The IR
 	 * sites see the same optics, so they take the green gain. Then remove the infrared
@@ -959,9 +1166,13 @@ static void rgb_linear_at(const uint16_t *raw, unsigned int width, unsigned int 
 		shade[2] = shading_q12[2]; shade[CFA_IR] = shading_q12[1];
 	}
 	int mean[4];
-	for (int channel = 0; channel < 4; channel++)
-		mean[channel] = n[channel] ?
-			(int)(((uint64_t)sum[channel] * shade[channel] / n[channel] + 2048) / 4096) : 0;
+	for (int channel = 0; channel < 4; channel++) {
+		/* Site counts are 2, 4 or 8 on both mosaics: a shift instead of a division. */
+		unsigned int c = n[channel];
+		uint64_t v = (uint64_t)sum[channel] * shade[channel];
+		mean[channel] = !c ? 0 : (c & (c - 1)) ? (int)((v / c + 2048) >> 12) :
+			(int)((v + ((uint64_t)c << 11)) >> (12 + __builtin_ctz(c)));
+	}
 	int ir = mean[CFA_IR];
 	int nir = n[CFA_IR] ? nir_estimate(ir, mean[1]) : 0;
 	int lin[3];
@@ -970,6 +1181,29 @@ static void rgb_linear_at(const uint16_t *raw, unsigned int width, unsigned int 
 			mean[channel] - ir + ((nir * nir_keep_q12[channel] + 2048) >> 12) : 0;
 		if (lin[channel] < 0)
 			lin[channel] = 0;
+	}
+	/* Front only (see chroma_keep_for); the rear's colour is reported good as it is. */
+	double keep = 1.0;
+	if (chroma_guard && n[CFA_IR]) {
+		/*
+		 * NIR relative to the window's strongest colour (2026-11-21, calibration shot): a red
+		 * flag in window light reflects 2-6x more NIR than its green; measured against green,
+		 * that genuine red was faded to brown (Windows renders it red). Measured against red,
+		 * it keeps its colour, while a window where NIR swamps every colour still fades.
+		 */
+		int top = lin[1];
+		if (chroma_guard_strongest) {
+			if (lin[0] > top) top = lin[0];
+			if (lin[2] > top) top = lin[2];
+		}
+		int g16 = top > 16 ? top : 16;
+		/* Cheap integer pre-checks; the exact fade only where one of them can apply. */
+		if ((gmax - gmin) * 4 > gmax + gmin + 64 ||
+		    nir > (wb_nir_ratio + NIR_CHROMA_FREE) * g16) {
+			double rho = (double)nir / g16;
+			double hf = (double)(gmax - gmin) / (gmax + gmin + 64.0);
+			keep = chroma_keep_for(rho, hf);
+		}
 	}
 	rgb[0] = (int)(((uint64_t)lin[0] * gain_q12[0] + 2048) / 4096);
 	rgb[1] = lin[1];
@@ -1001,6 +1235,13 @@ static void rgb_linear_at(const uint16_t *raw, unsigned int width, unsigned int 
 	 * white balance R and B ~1.85x, then the matrix): clipping each channel on its own turns
 	 * them pink or magenta. Desaturate towards their luminance instead, as ISPs do.
 	 */
+	if (keep < 1.0) {
+		double y = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+		for (int channel = 0; channel < 3; channel++) {
+			double v = y + keep * (rgb[channel] - y);
+			rgb[channel] = v < 0 ? 0 : (int)(v + 0.5);
+		}
+	}
 	soft_clip_rgb(rgb);
 	/*
 	 * Highlights: where any site in the window is near the sensor's clip level, its
@@ -1024,19 +1265,19 @@ static void rgb_linear_at(const uint16_t *raw, unsigned int width, unsigned int 
  * gamma curve (the earlier U/V box filter) is biased: gamma is concave, so the noisier
  * channels (R and B: 2 of 16 sites each, IR subtracted, amplified by the colour matrix)
  * lose more than G, and noisy greys turned green at high gain (2026-11-18 boot-11). Here
- * each pixel keeps its own linear luminance but takes the R:G:B ratios of the (2r+1)^2
- * average; near strong luma edges those ratios are pulled towards grey.
+ * each colour-grid point keeps its own linear luminance but takes the R:G:B ratios of the
+ * (2r+1)^2 average; near strong luma edges those ratios are pulled towards grey. The result
+ * goes to col_y/col_u/col_v.
  */
-static void linear_colour_to_yuv(int r, double gain)
+struct mix_job { int r, edges; };
+
+static void linear_colour_mix_rows(void *ctx, unsigned int row0, unsigned int row1)
 {
-	for (int c = 0; c < 3; c++) {
-		memcpy(lin_avg[c], lin_plane[c], sizeof(lin_avg[c]));
-		if (r > 0)
-			box_filter_plane(lin_avg[c], r);
-	}
-	int edges = r > 0 && gain > HIGH_GAIN_X;
-	for (int oy = 0; oy < OUT_HEIGHT; oy++)
-		for (int ox = 0; ox < OUT_WIDTH; ox++) {
+	const struct mix_job *job = ctx;
+	int r = job->r, edges = job->edges;
+
+	for (int oy = (int)row0; oy < (int)row1; oy++)
+		for (int ox = 0; ox < COL_WIDTH; ox++) {
 			int lr = lin_plane[0][oy][ox], lg = lin_plane[1][oy][ox], lb = lin_plane[2][oy][ox];
 			int ar = lin_avg[0][oy][ox], ag = lin_avg[1][oy][ox], ab = lin_avg[2][oy][ox];
 			int c[3];
@@ -1048,8 +1289,8 @@ static void linear_colour_to_yuv(int r, double gain)
 				/* Strength of the local luma edge, relative to the local level. */
 				double keep = 1.0;
 				if (edges) {
-					int xl = ox > 0 ? ox - 1 : ox, xr = ox + 1 < OUT_WIDTH ? ox + 1 : ox;
-					int yu = oy > 0 ? oy - 1 : oy, yd = oy + 1 < OUT_HEIGHT ? oy + 1 : oy;
+					int xl = ox > 0 ? ox - 1 : ox, xr = ox + 1 < COL_WIDTH ? ox + 1 : ox;
+					int yu = oy > 0 ? oy - 1 : oy, yd = oy + 1 < COL_HEIGHT ? oy + 1 : oy;
 					double gx = fabs((double)lin_plane[1][oy][xr] - lin_plane[1][oy][xl]);
 					double gy = fabs((double)lin_plane[1][yd][ox] - lin_plane[1][yu][ox]);
 					double rel = (gx + gy) / (ag + 32.0);
@@ -1068,11 +1309,214 @@ static void linear_colour_to_yuv(int r, double gain)
 			}
 			for (int k = 0; k < 3; k++)
 				c[k] = gamma_lut[c[k]];
-			plane_y[oy][ox] = (int16_t)((77 * c[0] + 150 * c[1] + 29 * c[2] + 128) >> 8);
-			plane_u[oy][ox] = (int16_t)((-43 * c[0] - 85 * c[1] + 128 * c[2]) >> 8);
-			plane_v[oy][ox] = (int16_t)((128 * c[0] - 107 * c[1] - 21 * c[2]) >> 8);
+			col_y[oy][ox] = (int16_t)((77 * c[0] + 150 * c[1] + 29 * c[2] + 128) >> 8);
+			col_u[oy][ox] = (int16_t)((-43 * c[0] - 85 * c[1] + 128 * c[2]) >> 8);
+			col_v[oy][ox] = (int16_t)((128 * c[0] - 107 * c[1] - 21 * c[2]) >> 8);
 		}
 }
+
+/*
+ * Rows are independent in the colour grid, the mix and the output pass, so each runs in
+ * BRIDGE_THREADS horizontal bands (1280x960 at 30 fps needs about 45 ms of one core per frame
+ * on the i7-1180G7; two bands bring each frame under 33 ms). Threads are started per pass;
+ * if one cannot be started its band runs here.
+ */
+#define BRIDGE_THREADS 2
+struct band {
+	void (*fn)(void *ctx, unsigned int row0, unsigned int row1);
+	void *ctx;
+	unsigned int row0, row1;
+};
+
+static void *band_run(void *arg)
+{
+	struct band *b = arg;
+
+	b->fn(b->ctx, b->row0, b->row1);
+	return NULL;
+}
+
+static void run_bands(void (*fn)(void *, unsigned int, unsigned int), void *ctx, unsigned int rows)
+{
+	pthread_t thread[BRIDGE_THREADS];
+	struct band band[BRIDGE_THREADS];
+	int started[BRIDGE_THREADS] = { 0 };
+
+	for (int i = 0; i < BRIDGE_THREADS; i++) {
+		band[i].fn = fn;
+		band[i].ctx = ctx;
+		band[i].row0 = rows * (unsigned int)i / BRIDGE_THREADS;
+		band[i].row1 = rows * (unsigned int)(i + 1) / BRIDGE_THREADS;
+	}
+	for (int i = 1; i < BRIDGE_THREADS; i++)
+		started[i] = pthread_create(&thread[i], NULL, band_run, &band[i]) == 0;
+	band_run(&band[0]);
+	for (int i = 1; i < BRIDGE_THREADS; i++) {
+		if (started[i])
+			pthread_join(thread[i], NULL);
+		else
+			band_run(&band[i]);
+	}
+}
+
+static void linear_colour_mix(int r, double gain)
+{
+	struct mix_job job = { r, r > 0 && gain > HIGH_GAIN_X };
+
+	for (int c = 0; c < 3; c++) {
+		memcpy(lin_avg[c], lin_plane[c], sizeof(lin_avg[c]));
+		if (r > 0)
+			box_filter_plane(lin_avg[c], r);
+	}
+	run_bands(linear_colour_mix_rows, &job, COL_HEIGHT);
+}
+
+/*
+ * Detail. Output pixels fall on colour-grid points or halfway between them; each takes the
+ * grid's Y', U, V (bilinear), so colour is exactly the 640x480 picture's. Its brightness is
+ * then scaled by its own green relative to the window's: the 2 green sites of the 2x2 block at
+ * its sensor position (half of all sites are green, in a checkerboard, on the RGB-IR and on
+ * the Bayer sensor) over the window's 8. That ratio is linear light, so Y' scales by its
+ * 1/2.4 power (detail_lut). Green from 2 sites is noisier than from 8, so at high gain the
+ * detail is reduced: full up to DETAIL_FULL_GAIN, DETAIL_MIN at DETAIL_MIN_GAIN and above.
+ */
+#define DETAIL_FULL_GAIN 8.0
+#define DETAIL_MIN_GAIN 32.0
+#define DETAIL_MIN 0.4
+#define DETAIL_LUT_MAX 1024	/* ratio 0..4 in steps of 1/256 */
+static int detail_enabled = 1;	/* 0: colour-grid brightness only (host-test negative control) */
+static uint16_t detail_lut[DETAIL_LUT_MAX + 1];	/* Q12 factor for Y' */
+static int detail_lut_q12 = -1;
+
+static int detail_q12_for_gain(double gain)
+{
+	if (!detail_enabled)
+		return 0;
+	double t = (gain - DETAIL_FULL_GAIN) / (DETAIL_MIN_GAIN - DETAIL_FULL_GAIN);
+	t = t < 0 ? 0 : t > 1 ? 1 : t;
+	return (int)((1.0 - (1.0 - DETAIL_MIN) * t) * 4096.0 + 0.5);
+}
+
+static void detail_lut_build(int detail_q12)
+{
+	if (detail_lut_q12 == detail_q12)
+		return;
+	for (int i = 0; i <= DETAIL_LUT_MAX; i++) {
+		double f = 1.0 + detail_q12 / 4096.0 * (i / 256.0 - 1.0);
+		double y = pow(f > 0 ? f : 0, 1.0 / 2.4) * 4096.0 + 0.5;
+		detail_lut[i] = (uint16_t)(y > 65535 ? 65535 : y);
+	}
+	detail_lut_q12 = detail_q12;
+}
+
+struct frame_job {
+	const uint16_t *raw;
+	unsigned int width, height, stride;
+	const unsigned int *gain_q12;
+	int detail_q12, tnr_threshold;
+	unsigned char *out;
+};
+
+/* Colour grid rows: one 4x4 window per point to linear R, G, B, and the window's green. */
+static void colour_grid_rows(void *ctx, unsigned int row0, unsigned int row1)
+{
+	const struct frame_job *job = ctx;
+
+	for (unsigned int oy = row0; oy < row1; oy++) {
+		unsigned int sy = crop_y + (unsigned int)(((uint64_t)oy * crop_h) / COL_HEIGHT);
+		for (unsigned int ox = 0; ox < COL_WIDTH; ox++) {
+			unsigned int sx = crop_x + (unsigned int)(((uint64_t)ox * crop_w) / COL_WIDTH);
+			int c[3];
+			unsigned int shading[3], green;
+			if (lsc_active) {
+				shading[0] = lsc_map[0][oy][ox];
+				shading[1] = lsc_map[1][oy][ox];
+				shading[2] = lsc_map[2][oy][ox];
+			}
+			rgb_linear_at(job->raw, job->width, job->height, job->stride, job->gain_q12, sx, sy,
+				      lsc_active ? shading : NULL, c, &green);
+			for (int k = 0; k < 3; k++)
+				lin_plane[k][oy][ox] = (int16_t)c[k];
+			col_green[oy][ox] = (uint16_t)green;
+		}
+	}
+}
+
+/*
+ * Output rows (unrotated row sy): brightness with detail, temporal luma filter, then YUYV into
+ * output row sy, or H - 1 - sy backwards with --rotate 180 (lens shading and the statistics
+ * stay in sensor positions). U/V of a pixel pair: the mean of the pair's bilinear colour-grid
+ * values (the pair covers grid point cx and halfway to cx + 1: weights 3/4, 1/4; rows: on a
+ * grid row or halfway).
+ *
+ * Temporal filter: where a pixel changed by no more than the threshold since the last output
+ * it moves only a third of the way, averaging noise in still areas; larger changes (motion)
+ * pass through at once, so no ghosts.
+ */
+static void output_rows(void *ctx, unsigned int row0, unsigned int row1)
+{
+	const struct frame_job *job = ctx;
+	const uint16_t *raw = job->raw;
+	unsigned int width = job->width, height = job->height, stride = job->stride;
+	int detail_q12 = job->detail_q12, tnr_threshold = job->tnr_threshold;
+
+	for (unsigned int oy = row0; oy < row1; oy++) {
+		unsigned int sy = crop_y + (unsigned int)(((uint64_t)oy * crop_h) / OUT_HEIGHT);
+		if (sy > height - 2)
+			sy = height - 2;
+		const uint16_t *r0 = raw + (size_t)sy * (stride / 2), *r1 = r0 + stride / 2;
+		const uint32_t (*m0)[4] = cfa_mask[sy & 3], (*m1)[4] = cfa_mask[(sy + 1) & 3];
+		int cy0 = (int)(oy >> 1), cy1 = (oy & 1) && cy0 + 1 < COL_HEIGHT ? cy0 + 1 : cy0;
+		int16_t *yrow = plane_y[oy];
+		unsigned char *prev = tnr_previous[oy];
+		for (unsigned int ox = 0; ox < OUT_WIDTH; ox++) {
+			int cx0 = (int)(ox >> 1), cx1 = (ox & 1) && cx0 + 1 < COL_WIDTH ? cx0 + 1 : cx0;
+			int y = (col_y[cy0][cx0] + col_y[cy0][cx1] + col_y[cy1][cx0] + col_y[cy1][cx1] + 2) >> 2;
+			if (detail_q12 > 0) {
+				unsigned int sx = crop_x + (unsigned int)(((uint64_t)ox * crop_w) / OUT_WIDTH);
+				if (sx > width - 2)
+					sx = width - 2;
+				unsigned int gw = (col_green[cy0][cx0] + col_green[cy0][cx1] +
+						   col_green[cy1][cx0] + col_green[cy1][cx1] + 2) >> 2;
+				/* The 2 green sites of the 2x2 block (masks: the phase varies). */
+				unsigned int g = (raw_lin_lut[r0[sx] & 1023] & m0[sx & 3][1]) +
+					(raw_lin_lut[r0[sx + 1] & 1023] & m0[(sx + 1) & 3][1]) +
+					(raw_lin_lut[r1[sx] & 1023] & m1[sx & 3][1]) +
+					(raw_lin_lut[r1[sx + 1] & 1023] & m1[(sx + 1) & 3][1]);
+				/* index = g / 2 / gw in steps of 1/256 */
+				unsigned int i = gw ? (g * 128u) / gw : 256u;
+				y = (y * detail_lut[i > DETAIL_LUT_MAX ? DETAIL_LUT_MAX : i] + 2048) >> 12;
+			}
+			if (tnr_have_previous) {
+				int d = y - prev[ox];
+				if (d >= -tnr_threshold && d <= tnr_threshold)
+					y = prev[ox] + (d >= 0 ? (d + 1) / 3 : -((-d + 1) / 3));
+			}
+			y = clamp8(y);
+			prev[ox] = (unsigned char)y;
+			yrow[ox] = (int16_t)y;
+		}
+		unsigned char *dst = job->out + (size_t)(output_rotate180 ? OUT_HEIGHT - 1 - oy : oy) *
+			OUT_WIDTH * 2;
+		for (unsigned int ox = 0; ox < OUT_WIDTH; ox += 2) {
+			int cx = (int)(ox >> 1), cxn = cx + 1 < COL_WIDTH ? cx + 1 : cx;
+			int u = 3 * (col_u[cy0][cx] + col_u[cy1][cx]) + col_u[cy0][cxn] + col_u[cy1][cxn];
+			int v = 3 * (col_v[cy0][cx] + col_v[cy1][cx]) + col_v[cy0][cxn] + col_v[cy1][cxn];
+			unsigned char U = clamp8(128 + (u >= 0 ? (u + 4) >> 3 : -((-u + 4) >> 3)));
+			unsigned char V = clamp8(128 + (v >= 0 ? (v + 4) >> 3 : -((-v + 4) >> 3)));
+			unsigned int at = output_rotate180 ? OUT_WIDTH - 2 - ox : ox;
+			dst[at * 2] = (unsigned char)yrow[output_rotate180 ? ox + 1 : ox];
+			dst[at * 2 + 1] = U;
+			dst[at * 2 + 2] = (unsigned char)yrow[output_rotate180 ? ox : ox + 1];
+			dst[at * 2 + 3] = V;
+		}
+	}
+}
+
+#ifdef IPU6_GPU
+static double monotonic_s(void);
+#include "ipu6-gpu.c"
+#endif
 
 static int convert_bayer_yuyv(const uint16_t *raw, unsigned int width,
 			      unsigned int height, unsigned int stride,
@@ -1087,67 +1531,39 @@ static int convert_bayer_yuyv(const uint16_t *raw, unsigned int width,
 
 	unsigned int gain_q12[3];
 	init_gamma();
+	init_raw_lut();
 	calculate_white_balance(raw, width, height, stride, gain_q12, mean_green);
 	if (wb_last_mean[1] > 0)
 		update_lsc(wb_white_rg, wb_white_bg, width, height);
-
-	/* 1. Demosaic every output pixel to full-range BT.601 Y/U/V. */
-	for (unsigned int oy = 0; oy < OUT_HEIGHT; oy++) {
-		unsigned int sy = (unsigned int)(((uint64_t)oy * height) / OUT_HEIGHT);
-		for (unsigned int ox = 0; ox < OUT_WIDTH; ox++) {
-			unsigned int sx = (unsigned int)(((uint64_t)ox * width) / OUT_WIDTH);
-			int c[3];
-			unsigned int shading[3];
-			if (lsc_active) {
-				shading[0] = lsc_map[0][oy][ox];
-				shading[1] = lsc_map[1][oy][ox];
-				shading[2] = lsc_map[2][oy][ox];
-			}
-			rgb_linear_at(raw, width, height, stride, gain_q12, sx, sy,
-				      lsc_active ? shading : NULL, c);
-			/* Lens shading stays indexed by sensor position; only the output is turned. */
-			unsigned int ty = output_rotate180 ? OUT_HEIGHT - 1 - oy : oy;
-			unsigned int tx = output_rotate180 ? OUT_WIDTH - 1 - ox : ox;
-			for (int k = 0; k < 3; k++)
-				lin_plane[k][ty][tx] = (int16_t)c[k];
+#ifdef IPU6_GPU
+	if (gpu.ok) {
+		if (gpu_convert(raw, width, height, stride, gain_q12, chroma_radius_for_gain(sensor_total_gain),
+				sensor_total_gain, out) == 0) {
+			tnr_have_previous = 1;
+			return 0;
 		}
+		gpu.ok = 0;
+		tnr_have_previous = 0;	/* the CPU's previous-frame plane is stale */
+		fprintf(stderr, "gpu: disabled for the rest of this run; converting on the CPU\n");
 	}
+#endif
+
+	struct frame_job job = {
+		raw, width, height, stride, gain_q12,
+		detail_q12_for_gain(sensor_total_gain), tnr_threshold_for_gain(sensor_total_gain), out
+	};
+	/* 1. Colour grid: demosaic one 4x4 window per point to linear R, G, B. */
+	run_bands(colour_grid_rows, &job, COL_HEIGHT);
 	/*
 	 * 2. Chroma noise: R and B are only 2 of 16 sites, so at high gain colour speckle
 	 * dominates. Colour comes from a neighbourhood average in linear light (growing with
 	 * gain); luma keeps full detail.
 	 */
-	linear_colour_to_yuv(chroma_radius_for_gain(sensor_total_gain), sensor_total_gain);
-	/*
-	 * 3. Luma noise: recursive temporal filter. Where a pixel changed by no more than
-	 * TNR_THRESHOLD since the last output it moves only a third of the way, averaging
-	 * noise in still areas; larger changes (motion) pass through at once, so no ghosts.
-	 */
-	int tnr_threshold = tnr_threshold_for_gain(sensor_total_gain);
-	for (unsigned int oy = 0; oy < OUT_HEIGHT; oy++)
-		for (unsigned int ox = 0; ox < OUT_WIDTH; ox++) {
-			int y = plane_y[oy][ox];
-			if (tnr_have_previous) {
-				int d = y - tnr_previous[oy][ox];
-				if (d >= -tnr_threshold && d <= tnr_threshold)
-					y = tnr_previous[oy][ox] + (d >= 0 ? (d + 1) / 3 : -((-d + 1) / 3));
-			}
-			y = clamp8(y);
-			tnr_previous[oy][ox] = (unsigned char)y;
-			plane_y[oy][ox] = (int16_t)y;
-		}
+	linear_colour_mix(chroma_radius_for_gain(sensor_total_gain), sensor_total_gain);
+	/* 3. Full-resolution brightness from the green sites, temporal luma filter, YUYV. */
+	detail_lut_build(job.detail_q12);
+	run_bands(output_rows, &job, OUT_HEIGHT);
 	tnr_have_previous = 1;
-
-	/* 4. Pack YUYV 4:2:2: U/V of each pixel pair averaged. */
-	for (unsigned int oy = 0; oy < OUT_HEIGHT; oy++) {
-		unsigned char *dst = out + (size_t)oy * OUT_WIDTH * 2;
-		for (unsigned int ox = 0; ox < OUT_WIDTH; ox += 2) {
-			dst[ox * 2] = (unsigned char)plane_y[oy][ox];
-			dst[ox * 2 + 1] = clamp8(128 + (plane_u[oy][ox] + plane_u[oy][ox + 1]) / 2);
-			dst[ox * 2 + 2] = (unsigned char)plane_y[oy][ox + 1];
-			dst[ox * 2 + 3] = clamp8(128 + (plane_v[oy][ox] + plane_v[oy][ox + 1]) / 2);
-		}
-	}
 	return 0;
 }
 
@@ -1168,6 +1584,7 @@ struct ae_state {
 	int height, base_max, long_max, margin;
 	/* Idle: frame stretched to idle_vblank; applied_vblank is what the sensor has now. */
 	int idle, idle_vblank, applied_vblank;
+	int fast;		/* frames left in the fast phase (ae_wake) */
 };
 
 /* VBLANK the sensor should have: the plan's, or the idle frame while nobody reads. */
@@ -1256,11 +1673,14 @@ static int ae_update(struct ae_state *ae, double mean_green)
 	int exposure = ae->exposure.value, again = ae->again.value, dgain = ae->dgain.value;
 	int vblank = ae->vblank.value;
 
-	ratio = mean_green > 1.0 ? AE_TARGET / mean_green : AE_MAX_STEP;
+	double max_step = ae->fast > 0 ? AE_FAST_MAX_STEP : AE_MAX_STEP;
+	ratio = mean_green > 1.0 ? AE_TARGET / mean_green : max_step;
+	if (ae->fast > 0 && ae_clip_fraction > AE_FAST_CLIP_FRACTION && ratio > 0.5)
+		ratio = 0.5;
 	if (ratio > 1.0 - AE_DEADBAND && ratio < 1.0 + AE_DEADBAND)
 		return 0;
-	if (ratio > AE_MAX_STEP) ratio = AE_MAX_STEP;
-	if (ratio < 1.0 / AE_MAX_STEP) ratio = 1.0 / AE_MAX_STEP;
+	if (ratio > max_step) ratio = max_step;
+	if (ratio < 1.0 / max_step) ratio = 1.0 / max_step;
 	ae_plan(ae, before * ratio);
 	return exposure != ae->exposure.value || again != ae->again.value ||
 	       dgain != ae->dgain.value || vblank != ae->vblank.value;
@@ -1432,7 +1852,10 @@ static void ae_frame(struct ae_state *ae, double mean_green)
 		       "(%.1f ms frame%s, %.1fx gain)\n", mean_green, AE_TARGET, ae->exposure.value,
 		       ae->again.value, ae->dgain.value, ae_effective_vblank(ae), ae_frame_ms(ae),
 		       ae->idle ? ", idle" : "", sensor_total_gain);
-	if (ae->frames % AE_INTERVAL || !ae_update(ae, mean_green))
+	int interval = ae->fast > 0 ? AE_FAST_INTERVAL : AE_INTERVAL;
+	if (ae->fast > 0)
+		ae->fast--;
+	if (ae->frames % interval || !ae_update(ae, mean_green))
 		return;
 	int vblank = ae_effective_vblank(ae);
 	if (ae_apply(ae, ae->exposure.value, vblank, ae->again.value, ae->dgain.value,
@@ -1442,6 +1865,13 @@ static void ae_frame(struct ae_state *ae, double mean_green)
 		return;
 	}
 	ae->applied_vblank = vblank;
+}
+
+/* An app started streaming (or the stream restarted): converge fast for the next frames. */
+static void ae_wake(struct ae_state *ae)
+{
+	ae->fast = AE_FAST_FRAMES;
+	ae->frames = 0;
 }
 
 /* A consumer started or stopped: switch between the planned and the idle frame at once. */
@@ -1786,6 +2216,229 @@ static void write_black(int fd, unsigned char *frame)
 }
 
 /*
+ * Where converted frames go: a v4l2loopback node (the USB camera HAL reads it), or, with the
+ * output "channel:<camera id>", the frame channel to the gbOS libcamera plugin
+ * (kernel/ipu6-channel.h). The channel is single-consumer like the loopback node, so readers is
+ * 0 or 1 and the capture loop (idle, conversion, idle stop) works the same for both.
+ */
+struct out_sink {
+	int channel;
+	int fd;				/* loopback node, or the channel's listening socket */
+	int client;			/* channel: connected plugin, or -1 */
+	int memfd;
+	unsigned char *map;
+	size_t map_bytes;
+	uint64_t seq;
+	unsigned int next_slot;
+	char name[64];
+};
+
+#define CHANNEL_SLOT_BYTES (((OUT_FRAME_BYTES) + 4095) & ~(size_t)4095)
+
+static socklen_t channel_address(const char *name, struct sockaddr_un *a)
+{
+	memset(a, 0, sizeof(*a));
+	a->sun_family = AF_UNIX;
+	/* Abstract: sun_path[0] = 0, then the name (no terminator; the length says where it ends). */
+	int n = snprintf(a->sun_path + 1, sizeof(a->sun_path) - 1, "%s%s", IPU6_CHANNEL_PREFIX, name);
+	return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
+}
+
+static int channel_open(struct out_sink *s, const char *name)
+{
+	struct sockaddr_un a;
+	socklen_t len;
+
+	if (!*name || strlen(name) >= sizeof(s->name) || strchr(name, '/'))
+		return -1;
+	snprintf(s->name, sizeof(s->name), "%s", name);
+	s->channel = 1;
+	s->client = -1;
+	s->map_bytes = IPU6_CHANNEL_HEADER_BYTES + IPU6_CHANNEL_SLOTS * CHANNEL_SLOT_BYTES;
+	s->memfd = memfd_create("gbos-camera-frames", MFD_CLOEXEC);
+	if (s->memfd < 0 || ftruncate(s->memfd, (off_t)s->map_bytes)) {
+		perror("frame channel: memfd");
+		return -1;
+	}
+	s->map = mmap(NULL, s->map_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, s->memfd, 0);
+	if (s->map == MAP_FAILED) {
+		s->map = NULL;
+		perror("frame channel: mmap");
+		return -1;
+	}
+	s->fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+	len = channel_address(name, &a);
+	if (s->fd < 0 || bind(s->fd, (struct sockaddr *)&a, len) || listen(s->fd, 2)) {
+		fprintf(stderr, "frame channel: cannot listen on @%s%s: %s\n", IPU6_CHANNEL_PREFIX, name,
+			strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
+static void channel_drop_client(struct out_sink *s, const char *why)
+{
+	if (s->client < 0)
+		return;
+	close(s->client);
+	s->client = -1;
+	printf("frame channel: client %s\n", why);
+	fflush(stdout);
+}
+
+/* A new client: the newest connection wins (a restarted camera service reconnects). */
+static void channel_accept(struct out_sink *s)
+{
+	for (;;) {
+		int c = accept4(s->fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+		if (c < 0)
+			return;
+		struct ipu6_channel_hello h = {
+			.magic = IPU6_CHANNEL_MAGIC, .version = IPU6_CHANNEL_VERSION,
+			.width = OUT_WIDTH, .height = OUT_HEIGHT, .slots = IPU6_CHANNEL_SLOTS,
+			.slot_bytes = (uint32_t)CHANNEL_SLOT_BYTES, .header_bytes = IPU6_CHANNEL_HEADER_BYTES,
+			.map_bytes = s->map_bytes,
+		};
+		char control[CMSG_SPACE(sizeof(int))];
+		struct iovec iov = { .iov_base = &h, .iov_len = sizeof(h) };
+		struct msghdr m = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = control,
+				    .msg_controllen = sizeof(control) };
+		memset(control, 0, sizeof(control));
+		struct cmsghdr *cm = CMSG_FIRSTHDR(&m);
+		cm->cmsg_level = SOL_SOCKET;
+		cm->cmsg_type = SCM_RIGHTS;
+		cm->cmsg_len = CMSG_LEN(sizeof(int));
+		memcpy(CMSG_DATA(cm), &s->memfd, sizeof(int));
+		if (sendmsg(c, &m, MSG_NOSIGNAL) != (ssize_t)sizeof(h)) {
+			fprintf(stderr, "frame channel: hello failed: %s\n", strerror(errno));
+			close(c);
+			continue;
+		}
+		channel_drop_client(s, "replaced by a new connection");
+		s->client = c;
+		s->seq = 0;
+		struct ipu6_channel_shared *sh = (struct ipu6_channel_shared *)s->map;
+		for (int k = 0; k < IPU6_CHANNEL_SLOTS; k++)
+			__atomic_store_n(&sh->seq[k], 0, __ATOMIC_RELEASE);
+		printf("frame channel: client connected (%ux%u YUYV, %d slots)\n", OUT_WIDTH, OUT_HEIGHT,
+		       IPU6_CHANNEL_SLOTS);
+		fflush(stdout);
+	}
+}
+
+/* 1 while a client is connected. Never blocks. */
+static int channel_readers(struct out_sink *s)
+{
+	channel_accept(s);
+	if (s->client >= 0) {
+		struct pollfd p = { .fd = s->client, .events = POLLIN };
+		if (poll(&p, 1, 0) > 0) {
+			char buf[64];
+			ssize_t n = recv(s->client, buf, sizeof(buf), MSG_DONTWAIT);
+			if ((p.revents & (POLLHUP | POLLERR)) || n == 0 ||
+			    (n < 0 && errno != EAGAIN && errno != EINTR))
+				channel_drop_client(s, "disconnected");
+		}
+	}
+	return s->client >= 0;
+}
+
+static void channel_send(struct out_sink *s, const unsigned char *frame, const struct ipu6_channel_frame *meta)
+{
+	struct ipu6_channel_shared *sh = (struct ipu6_channel_shared *)s->map;
+	unsigned int k = s->next_slot;
+	struct ipu6_channel_frame f = *meta;
+
+	if (s->client < 0)
+		return;
+	s->next_slot = (k + 1) % IPU6_CHANNEL_SLOTS;
+	__atomic_store_n(&sh->seq[k], 0, __ATOMIC_RELEASE);
+	memcpy(s->map + IPU6_CHANNEL_HEADER_BYTES + k * CHANNEL_SLOT_BYTES, frame, OUT_FRAME_BYTES);
+	f.magic = IPU6_CHANNEL_MAGIC;
+	f.slot = k;
+	f.seq = ++s->seq;
+	__atomic_store_n(&sh->seq[k], f.seq, __ATOMIC_RELEASE);
+	if (send(s->client, &f, sizeof(f), MSG_DONTWAIT | MSG_NOSIGNAL) < 0 &&
+	    errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+		channel_drop_client(s, "gone (send failed)");
+}
+
+/* Opens the output; for a loopback node also sets its format and primes it with black. */
+static int sink_open(struct out_sink *s, const char *out_dev)
+{
+	memset(s, 0, sizeof(*s));
+	s->fd = s->client = s->memfd = -1;
+	if (!strncmp(out_dev, "channel:", 8))
+		return channel_open(s, out_dev + 8);
+	s->fd = open(out_dev, O_RDWR | O_CLOEXEC);
+	if (s->fd < 0) {
+		perror("open loopback node");
+		return -1;
+	}
+	struct v4l2_format outfmt = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT };
+	outfmt.fmt.pix.width = OUT_WIDTH;
+	outfmt.fmt.pix.height = OUT_HEIGHT;
+	outfmt.fmt.pix.pixelformat = OUT_FOURCC;
+	outfmt.fmt.pix.field = V4L2_FIELD_NONE;
+	outfmt.fmt.pix.bytesperline = OUT_WIDTH * 2;
+	outfmt.fmt.pix.sizeimage = OUT_FRAME_BYTES;
+	outfmt.fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;
+	if (ioctl(s->fd, VIDIOC_S_FMT, &outfmt) ||
+	    outfmt.fmt.pix.pixelformat != OUT_FOURCC ||
+	    outfmt.fmt.pix.width != OUT_WIDTH || outfmt.fmt.pix.height != OUT_HEIGHT ||
+	    outfmt.fmt.pix.bytesperline != OUT_WIDTH * 2 ||
+	    outfmt.fmt.pix.sizeimage < OUT_FRAME_BYTES) {
+		perror("configure V4L2 loopback output");
+		return -1;
+	}
+	return 0;
+}
+
+static void sink_close(struct out_sink *s)
+{
+	if (s->client >= 0) close(s->client);
+	if (s->fd >= 0) close(s->fd);
+	if (s->map) munmap(s->map, s->map_bytes);
+	if (s->memfd >= 0) close(s->memfd);
+	s->fd = s->client = s->memfd = -1;
+	s->map = NULL;
+}
+
+static int sink_readers(struct out_sink *s)
+{
+	return s->channel ? channel_readers(s) : loopback_readers(s->fd);
+}
+
+/* 0 or -1 (loopback write failed); a channel frame is dropped rather than fail. */
+static int sink_write(struct out_sink *s, const unsigned char *frame, const struct ipu6_channel_frame *meta)
+{
+	if (s->channel) {
+		channel_send(s, frame, meta);
+		return 0;
+	}
+	return write(s->fd, frame, OUT_FRAME_BYTES) == (ssize_t)OUT_FRAME_BYTES ? 0 : -1;
+}
+
+/* The loopback node for its client-usage events; -1 for a channel (nothing to drain). */
+static int sink_event_fd(const struct out_sink *s)
+{
+	return s->channel ? -1 : s->fd;
+}
+
+/* Stopped: wait up to timeout_ms for a consumer (an event or a connection). <0 on a poll error. */
+static int sink_wait(struct out_sink *s, int timeout_ms)
+{
+	struct pollfd p = { .fd = s->fd, .events = s->channel ? POLLIN : POLLPRI };
+	int r = poll(&p, 1, timeout_ms);
+
+	if (r < 0)
+		return errno == EINTR ? 0 : -1;
+	if (!s->channel && r > 0 && (p.revents & POLLPRI))
+		loopback_drain_events(s->fd);
+	return 0;
+}
+
+/*
  * Frame health: counts a run of bad frames (or poll timeouts) and says when to give up.
  * Returns 1 to give up: nothing good for BAD_FRAME_GIVE_UP_S seconds.
  */
@@ -2044,6 +2697,152 @@ static int idle_resume_stream(struct capture *cap)
 	return r;
 }
 
+/*
+ * Raw dumps for tuning on the build machine (CAMERA_RAW_DUMP=N in gbos.cfg; the launcher passes
+ * IPU6_RAW_DUMP_DIR and IPU6_RAW_DUMP_MAX). About one second into an app's session the bridge
+ * writes the raw frame, the YUYV picture it made from it, and its state, as
+ * <dir>/raw-<sensor>-<n>.{raw,yuyv,txt}; tools/ipu6_raw_render.c renders a dump with the CPU
+ * (and GPU) path and compares it with the saved picture. At most IPU6_RAW_DUMP_MAX per run.
+ */
+static const char *raw_dump_dir;
+static int raw_dump_left;
+
+/*
+ * The files are written by a detached thread from copies, never from the frame loop: boot-20's
+ * first rear dump (16 MB raw + 4 MB YUYV onto the FAT stick) stalled the loop long enough for
+ * the USB HAL to give up ("v4l2 dequeue timeout", "serious device error"). One dump at a time;
+ * one requested while another is still being written is skipped.
+ */
+struct raw_dump_job {
+	char base[480];
+	void *raw, *yuyv;
+	size_t raw_size;
+	char info[1024];
+};
+static volatile int raw_dump_busy;
+
+static void raw_dump_write(const char *path, const void *data, size_t size)
+{
+	FILE *f = fopen(path, "wb");
+
+	if (f) {
+		fwrite(data, 1, size, f);
+		fclose(f);
+	}
+}
+
+static void *raw_dump_thread(void *arg)
+{
+	struct raw_dump_job *job = arg;
+	char path[512];
+
+	snprintf(path, sizeof(path), "%s.raw", job->base);
+	raw_dump_write(path, job->raw, job->raw_size);
+	snprintf(path, sizeof(path), "%s.yuyv", job->base);
+	raw_dump_write(path, job->yuyv, OUT_FRAME_BYTES);
+	snprintf(path, sizeof(path), "%s.txt", job->base);	/* last: the dump is complete */
+	raw_dump_write(path, job->info, strlen(job->info));
+	printf("raw dump: %s.{raw,yuyv,txt} written\n", job->base);
+	fflush(stdout);
+	free(job->raw);
+	free(job->yuyv);
+	free(job);
+	__atomic_store_n(&raw_dump_busy, 0, __ATOMIC_RELEASE);
+	return NULL;
+}
+
+/* Returns 0 when a dump was started (or written, with wait set: the host tests). */
+static int raw_dump_start(const char *sensor, const uint16_t *raw, unsigned int width,
+			  unsigned int height, unsigned int stride, const unsigned char *yuyv,
+			  const struct ae_state *ae, int wait)
+{
+	static int n;
+	struct raw_dump_job *job;
+	pthread_t thread;
+
+	if (!raw_dump_dir || raw_dump_left <= 0 || __atomic_load_n(&raw_dump_busy, __ATOMIC_ACQUIRE))
+		return -1;
+	job = calloc(1, sizeof(*job));
+	if (!job)
+		return -1;
+	job->raw_size = (size_t)stride * height;
+	job->raw = malloc(job->raw_size);
+	job->yuyv = malloc(OUT_FRAME_BYTES);
+	if (!job->raw || !job->yuyv) {
+		free(job->raw);
+		free(job->yuyv);
+		free(job);
+		return -1;
+	}
+	memcpy(job->raw, raw, job->raw_size);
+	memcpy(job->yuyv, yuyv, OUT_FRAME_BYTES);
+	raw_dump_left--;
+	n++;
+	snprintf(job->base, sizeof(job->base), "%s/raw-%s-%d", raw_dump_dir, sensor, n);
+	snprintf(job->info, sizeof(job->info),
+		 "sensor %s\nwidth %u\nheight %u\nstride %u\nout %dx%d\nrotate %d\n"
+		 "gain %.4f\nexposure %d\nagain %d\ndgain %d\nvblank %d\n"
+		 "wb_white %.5f %.5f\nwb_mean %.2f %.2f %.2f\nwb_gain %u %u\nnir_ratio %.4f\n"
+		 "ccm_active %d\nccm_pick %d %d %.3f\nlsc_active %d\nlsc_pick %d %d %.3f %.3f\n"
+		 "converter %s\n",
+		 sensor, width, height, stride, OUT_WIDTH, OUT_HEIGHT, output_rotate180,
+		 sensor_total_gain, ae->exposure.value, ae->again.value, ae->dgain.value, ae->vblank.value,
+		 wb_white_rg, wb_white_bg, wb_last_mean[0], wb_last_mean[1], wb_last_mean[2],
+		 wb_last_gain_q12[0], wb_last_gain_q12[2], wb_nir_ratio,
+		 ccm_active, ccm_pick[0], ccm_pick[1], ccm_weight, lsc_active, lsc_pick[0], lsc_pick[1],
+		 lsc_weight, lsc_strength,
+#ifdef IPU6_GPU
+		 gpu.ok ? "gpu" : "cpu"
+#else
+		 "cpu"
+#endif
+		);
+	__atomic_store_n(&raw_dump_busy, 1, __ATOMIC_RELEASE);
+	printf("raw dump: %s (writing in the background)\n", job->base);
+	if (wait) {
+		raw_dump_thread(job);
+		return 0;
+	}
+	if (pthread_create(&thread, NULL, raw_dump_thread, job)) {
+		raw_dump_thread(job);	/* no thread: write now rather than lose it */
+		return 0;
+	}
+	pthread_detach(thread);
+	return 0;
+}
+
+static void raw_dump(const char *sensor, const uint16_t *raw, unsigned int width, unsigned int height,
+		     unsigned int stride, const unsigned char *yuyv, const struct ae_state *ae)
+{
+	raw_dump_start(sensor, raw, width, height, stride, yuyv, ae, 0);
+}
+
+/*
+ * What a frame channel client reports to Android for this frame: the state AE has set (the
+ * sensor applies a change a frame or two later, so this lags a step while AE moves).
+ */
+static void frame_meta(struct ipu6_channel_frame *m, const struct ae_state *ae, const struct v4l2_buffer *b)
+{
+	struct timespec now;
+	double line_us;
+
+	memset(m, 0, sizeof(*m));
+	if (b->timestamp.tv_sec || b->timestamp.tv_usec) {
+		m->timestamp_ns = (int64_t)b->timestamp.tv_sec * 1000000000 + (int64_t)b->timestamp.tv_usec * 1000;
+	} else {
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		m->timestamp_ns = (int64_t)now.tv_sec * 1000000000 + now.tv_nsec;
+	}
+	/* The default frame (height + default VBLANK lines) is 1/30 s; ae_frame_ms assumes the same. */
+	line_us = ae->height > 0 ? 1e6 / 30 / (ae->height + (ae->vblank.present ? ae->vblank.def : 0)) : 0;
+	m->exposure_us = (int32_t)(ae->exposure.value * line_us + 0.5);
+	m->frame_duration_us = (int32_t)(ae_frame_ms(ae) * 1000 + 0.5);
+	m->analogue_gain = ae->again.min > 0 ? (float)ae->again.value / ae->again.min : 1.0f;
+	m->digital_gain = ae->dgain.present && ae->dgain.min > 0 ? (float)ae->dgain.value / ae->dgain.min : 1.0f;
+	m->wb_gain_r = wb_last_gain_q12[0] ? wb_last_gain_q12[0] / 4096.0f : 1.0f;
+	m->wb_gain_b = wb_last_gain_q12[2] ? wb_last_gain_q12[2] / 4096.0f : 1.0f;
+}
+
 static int capture_to_loopback(const char *media_dev, const char *out_dev,
 			       const struct sensor_profile *profile)
 {
@@ -2055,14 +2854,15 @@ static int capture_to_loopback(const char *media_dev, const char *out_dev,
 	struct media_device_info info = { 0 };
 	struct path path;
 	char sensor_path[128], csi_path[128], capture_path[128];
-	int mfd = -1, sfd = -1, cfd = -1, vfd = -1, outfd = -1;
+	int mfd = -1, sfd = -1, cfd = -1, vfd = -1;
+	struct out_sink sink = { .fd = -1, .client = -1, .memfd = -1 };
 	int linked = 0, result = 1, have_lens = 0;
 	struct capture cap = { .fd = -1 };
 	struct bridge_buffer *buffers = cap.buffers;
 	struct v4l2_subdev_format sensor = { 0 }, saved_sink = { 0 }, set;
 	struct v4l2_format video = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE };
 	struct v4l2_format saved_video = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE };
-	unsigned int frame_count = 0;
+	unsigned int frame_count = 0, session_frames = 0;
 	int last_readers = -2;
 	unsigned char *output = NULL;
 	enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -2087,11 +2887,12 @@ static int capture_to_loopback(const char *media_dev, const char *out_dev,
 	sfd = open(sensor_path, O_RDWR | O_CLOEXEC);
 	cfd = open(csi_path, O_RDWR | O_CLOEXEC);
 	vfd = open(capture_path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
-	outfd = open(out_dev, O_RDWR | O_CLOEXEC);
-	if (sfd < 0 || cfd < 0 || vfd < 0 || outfd < 0) {
-		perror("open camera or loopback node");
+	if (sfd < 0 || cfd < 0 || vfd < 0) {
+		perror("open camera nodes");
 		goto done;
 	}
+	if (sink_open(&sink, out_dev))
+		goto done;
 	if (subformat(sfd, path.sensor_pad->index, &sensor, VIDIOC_SUBDEV_G_FMT) ||
 	    subformat(cfd, path.csi_sink->index, &saved_sink, VIDIOC_SUBDEV_G_FMT) ||
 	    ioctl(vfd, VIDIOC_G_FMT, &saved_video)) {
@@ -2135,22 +2936,6 @@ static int capture_to_loopback(const char *media_dev, const char *out_dev,
 	cap.min_size = video.fmt.pix.sizeimage;
 	if (capture_start(&cap))
 		goto done;
-	struct v4l2_format outfmt = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT };
-	outfmt.fmt.pix.width = OUT_WIDTH;
-	outfmt.fmt.pix.height = OUT_HEIGHT;
-	outfmt.fmt.pix.pixelformat = OUT_FOURCC;
-	outfmt.fmt.pix.field = V4L2_FIELD_NONE;
-	outfmt.fmt.pix.bytesperline = OUT_WIDTH * 2;
-	outfmt.fmt.pix.sizeimage = OUT_FRAME_BYTES;
-	outfmt.fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;
-	if (ioctl(outfd, VIDIOC_S_FMT, &outfmt) ||
-	    outfmt.fmt.pix.pixelformat != OUT_FOURCC ||
-	    outfmt.fmt.pix.width != OUT_WIDTH || outfmt.fmt.pix.height != OUT_HEIGHT ||
-	    outfmt.fmt.pix.bytesperline != OUT_WIDTH * 2 ||
-	    outfmt.fmt.pix.sizeimage < OUT_FRAME_BYTES) {
-		perror("configure V4L2 loopback output");
-		goto done;
-	}
 	output = malloc(OUT_FRAME_BYTES);
 	if (!output)
 		goto done;
@@ -2160,7 +2945,7 @@ static int capture_to_loopback(const char *media_dev, const char *out_dev,
 		output[i + 2] = 16;
 		output[i + 3] = 128;
 	}
-	if (write(outfd, output, OUT_FRAME_BYTES) != (ssize_t)OUT_FRAME_BYTES) {
+	if (!sink.channel && sink_write(&sink, output, NULL)) {
 		perror("prime V4L2 loopback");
 		goto done;
 	}
@@ -2169,12 +2954,15 @@ static int capture_to_loopback(const char *media_dev, const char *out_dev,
 	af_init(&af, have_lens ? lens_path : NULL);
 	signal(SIGINT, stop_bridge);
 	signal(SIGTERM, stop_bridge);
-	int usage_events = loopback_subscribe_usage(outfd);
-	printf("bridge active: %ux%u %s to %ux%u YUYV%s; ", video.fmt.pix.width, video.fmt.pix.height,
+	int usage_events = sink.channel || loopback_subscribe_usage(sink.fd);
+	printf("bridge active: %ux%u %s to %ux%u YUYV%s%s%s%s; ", video.fmt.pix.width, video.fmt.pix.height,
 	       profile->rgbir ? "RGB-IR" : "Bayer", OUT_WIDTH, OUT_HEIGHT,
-	       output_rotate180 ? ", rotated 180" : "");
+	       output_rotate180 ? ", rotated 180" : "",
+	       sink.channel ? " via the frame channel @" IPU6_CHANNEL_PREFIX : "",
+	       sink.channel ? sink.name : "", sink.channel ? " (libcamera)" : "");
 	if (idle_stop_s > 0)
 		printf("sensor stops after %.0f s without a consumer (wake-up: %s)\n", idle_stop_s,
+		       sink.channel ? "channel connection" :
 		       usage_events ? "client-usage event" : "polling readers_active");
 	else
 		printf("sensor remains streaming until stop\n");
@@ -2189,16 +2977,12 @@ static int capture_to_loopback(const char *media_dev, const char *out_dev,
 			 * event wakes us at once; readers_active is checked on every wake-up and
 			 * at least every second (every 250 ms without the event).
 			 */
-			struct pollfd ofd = { .fd = outfd, .events = POLLPRI };
-			int r = poll(&ofd, 1, usage_events ? 1000 : 250);
-			if (r < 0 && errno != EINTR) {
-				perror("poll loopback");
+			if (sink_wait(&sink, usage_events ? 1000 : 250)) {
+				perror("poll loopback or frame channel");
 				result = 1;
 				break;
 			}
-			if (r > 0 && (ofd.revents & POLLPRI))
-				loopback_drain_events(outfd);
-			int readers = loopback_readers(outfd);
+			int readers = sink_readers(&sink);
 			double now = monotonic_s();
 			if (idle_decide(&idle, readers, now, idle_stop_s) != IDLE_START)
 				continue;
@@ -2208,7 +2992,7 @@ static int capture_to_loopback(const char *media_dev, const char *out_dev,
 			fflush(stdout);
 			/* A frame at once, so the consumer is not left waiting; real ones follow. */
 			have_output = 0;
-			write_black(outfd, output);
+			write_black(sink.channel ? -1 : sink.fd, output);
 			idle_watchdog("restart: active frame controls", idle_step_timeout_s);
 			ae_set_idle(&ae, 0);	/* the planned frame, before the sensor powers up */
 			if (idle_resume_stream(&cap)) {
@@ -2259,24 +3043,27 @@ static int capture_to_loopback(const char *media_dev, const char *out_dev,
 			result = 1;
 			break;
 		}
-		int readers = loopback_readers(outfd);
+		int readers = sink_readers(&sink);
 		if (readers != last_readers) {
 			printf("bridge: %s\n", readers < 0 ? "readers_active unavailable; converting every frame" :
 			       readers ? "consumer streaming; converting frames" :
 			       idle_stop_s > 0 ? "no consumer; idle (sensor and auto-exposure keep running until the idle stop)" :
 			       "no consumer; idle (sensor and auto-exposure keep running)");
 			last_readers = readers;
+			session_frames = 0;
 			tnr_reset();	/* the scene may have changed while idle */
 			ae_set_idle(&ae, !bridge_should_convert(readers));
-			if (bridge_should_convert(readers))
+			if (bridge_should_convert(readers)) {
+				ae_wake(&ae);
 				af_start(&af);
+			}
 		}
 		if (idle_decide(&idle, readers, monotonic_s(), idle_stop_s) == IDLE_STOP) {
 			double t0 = monotonic_s();
 			printf("bridge: no consumer for %.0f s; stopping the sensor stream (stop %u)\n",
 			       idle_stop_s, idle.stops + 1);
 			fflush(stdout);
-			idle_pause_stream(&cap, &af, outfd);	/* the dequeued buffer is requeued on restart */
+			idle_pause_stream(&cap, &af, sink_event_fd(&sink));	/* the dequeued buffer is requeued on restart */
 			idle.stopped = 1;
 			idle.stops++;
 			printf("bridge: sensor stream stopped in %.1f s; sensor%s powered down, waiting for a consumer\n",
@@ -2290,8 +3077,8 @@ static int capture_to_loopback(const char *media_dev, const char *out_dev,
 		if (bad) {
 			int give_up = frame_health_bad(&health, monotonic_s(), bad, b.flags, b.bytesused);
 			/* Keep the consumer fed with the last picture rather than nothing. */
-			if (!give_up && have_output && bridge_should_convert(readers) &&
-			    write(outfd, output, OUT_FRAME_BYTES) != (ssize_t)OUT_FRAME_BYTES) {
+			if (!give_up && have_output && bridge_should_convert(readers) && !sink.channel &&
+			    sink_write(&sink, output, NULL)) {
 				fprintf(stderr, "write loopback frame failed: %s\n", strerror(errno));
 				give_up = 1;
 			}
@@ -2311,6 +3098,8 @@ static int capture_to_loopback(const char *media_dev, const char *out_dev,
 			woke_at = -1;
 		}
 		double mean_green = 0;
+		struct ipu6_channel_frame meta;
+		frame_meta(&meta, &ae, &b);
 		if (!bridge_should_convert(readers)) {
 			/* Idle: only the cheap sampled statistics, so exposure is right on resume. */
 			unsigned int unused_gain[3];
@@ -2320,7 +3109,7 @@ static int capture_to_loopback(const char *media_dev, const char *out_dev,
 		} else if (convert_bayer_yuyv(buffers[b.index].data, video.fmt.pix.width,
 					      video.fmt.pix.height, video.fmt.pix.bytesperline,
 					      output, OUT_FRAME_BYTES, &mean_green) ||
-			   write(outfd, output, OUT_FRAME_BYTES) != (ssize_t)OUT_FRAME_BYTES) {
+			   sink_write(&sink, output, &meta)) {
 			fprintf(stderr, "convert or write loopback frame failed: %s\n", strerror(errno));
 			result = 1;
 			break;
@@ -2333,9 +3122,17 @@ static int capture_to_loopback(const char *media_dev, const char *out_dev,
 		if (!af_busy)
 			ae_frame(&ae, mean_green);
 		frame_count++;
-		if (frame_count == 30 || frame_count % 900 == 0)
+		/* Colour state while an app uses the camera: ~1 s in, then every 300 frames. */
+		int converting = bridge_should_convert(readers);
+		if (converting)
+			session_frames++;
+		if (frame_count == 30 || frame_count % 900 == 0 ||
+		    (converting && (session_frames == 30 || session_frames % 300 == 0)))
 			log_cfa_phases(buffers[b.index].data, video.fmt.pix.width,
 				       video.fmt.pix.height, video.fmt.pix.bytesperline, frame_count);
+		if (converting && session_frames == 30)
+			raw_dump(profile->cal_prefix, buffers[b.index].data, video.fmt.pix.width,
+				 video.fmt.pix.height, video.fmt.pix.bytesperline, output, &ae);
 		if (ioctl(vfd, VIDIOC_QBUF, &b)) {
 			perror("requeue IPU6 frame");
 			result = 1;
@@ -2363,7 +3160,7 @@ done:
 	if (linked && setup_link(mfd, &path, path.output->flags))
 		fprintf(stderr, "could not restore IPU6 media link; reboot required\n");
 	free(output);
-	if (outfd >= 0) close(outfd);
+	sink_close(&sink);
 	if (vfd >= 0) close(vfd);
 	if (cfd >= 0) close(cfd);
 	if (sfd >= 0) close(sfd);
@@ -2473,9 +3270,18 @@ int main(int argc, char **argv)
 	struct bridge_options o;
 
 	(void)probe;
+#ifdef IPU6_GPU
+	/* --probe-gpu: can this build convert on the GPU here? (the launcher asks before using it) */
+	if (argc == 2 && !strcmp(argv[1], "--probe-gpu")) {
+		if (gpu_init())
+			return 1;
+		printf("gpu: Vulkan compute on %s\n", gpu.name);
+		return 0;
+	}
+#endif
 	if (parse_bridge_args(argc, argv, &o)) {
 		fprintf(stderr, "usage: %s [--sensor ov5675|ov8856] [--rotate 0|180] [--idle-stop SECONDS] "
-			"/dev/mediaN /dev/videoN [calibration dir or colour-matrix table]\n", argv[0]);
+			"/dev/mediaN /dev/videoN|channel:CAMERA_ID [calibration dir or colour-matrix table]\n", argv[0]);
 		return 2;
 	}
 	setvbuf(stdout, NULL, _IOLBF, 0);
@@ -2487,6 +3293,21 @@ int main(int argc, char **argv)
 	       o.rotate180 ? "; output rotated 180" : "");
 	if (o.calibration)
 		load_calibration(o.calibration, o.profile->cal_prefix);
+	raw_dump_dir = getenv("IPU6_RAW_DUMP_DIR");
+	if (raw_dump_dir && getenv("IPU6_RAW_DUMP_MAX"))
+		raw_dump_left = atoi(getenv("IPU6_RAW_DUMP_MAX"));
+	if (raw_dump_dir && raw_dump_left > 0)
+		printf("raw dumps: up to %d into %s\n", raw_dump_left, raw_dump_dir);
+#ifdef IPU6_GPU
+	/* IPU6_GPU=0 (gbos.cfg CAMERA_GPU=0, via the launcher) keeps this build on the CPU. */
+	const char *use_gpu = getenv("IPU6_GPU");
+	if (use_gpu && !strcmp(use_gpu, "0"))
+		printf("gpu: off (IPU6_GPU=0); converting on the CPU\n");
+	else if (gpu_init() == 0)
+		printf("gpu: converting on %s (Vulkan compute)\n", gpu.name);
+#else
+	printf("gpu: not in this build; converting on the CPU\n");
+#endif
 	return capture_to_loopback(o.media, o.output, o.profile);
 }
 #endif

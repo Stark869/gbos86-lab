@@ -188,6 +188,7 @@ static int uniform_frame_worst_chroma(int rgbir, unsigned int ir, int *luma)
 		for (unsigned int x = 0; x < width; x++)
 			frame[(size_t)y * width + x] =
 				(uint16_t[]){ uniform_levels[0], uniform_levels[1], uniform_levels[2], (uint16_t)ir }[channel_at(x, y)];
+	tnr_reset();	/* no blending with an earlier test's picture */
 	if (convert_bayer_yuyv(frame, width, height, width * 2, out, sizeof(out), NULL)) {
 		free(frame);
 		return 999;
@@ -234,6 +235,7 @@ static int test_ir_subtraction(void)
 				frame[y * width + x] = channel_at(x, y) == CFA_IR ?
 					(uint16_t)(BLACK_LEVEL + (ir ? 300 : 0)) :
 					(uint16_t)(BLACK_LEVEL + 400 + (ir ? 300 : 0));
+		tnr_reset();	/* compare the two frames, not a blend */
 		if (convert_bayer_yuyv(frame, width, height, width * 2, out, sizeof(out), NULL))
 			return 2;
 		for (size_t i = 0; i < OUT_FRAME_BYTES; i += 2)
@@ -317,7 +319,7 @@ static int test_saturation(void)
 		tnr_reset();
 		if (convert_bayer_yuyv(frame, 64, 64, 128, out, sizeof(out), NULL))
 			return 1;
-		v[i] = out[(240 * OUT_WIDTH + 100) * 2 + 3] - 128;	/* warm half: V > 0 */
+		v[i] = out[((OUT_HEIGHT / 2) * OUT_WIDTH + OUT_WIDTH / 8) * 2 + 3] - 128;	/* warm half: V > 0 */
 	}
 	saturation_q12 = saved_s; chroma_radius = saved_r;
 	return v[0] > 0 && v[1] > v[0] + 2 ? 0 : 2;
@@ -372,7 +374,7 @@ static int luma_after(unsigned int first, unsigned int second, int filtered)
 	}
 	grey_level = second; fill_bayer(frame, 64, 64, flat_grey);
 	convert_bayer_yuyv(frame, 64, 64, 128, out, sizeof(out), NULL);
-	return out[(240 * OUT_WIDTH + 320) * 2];
+	return out[((OUT_HEIGHT / 2) * OUT_WIDTH + OUT_WIDTH / 2) * 2];
 }
 
 static int test_temporal_filter(void)
@@ -476,20 +478,25 @@ static int test_lens_shading(void)
 		return 2;
 	unlink(path);
 
-	/* Gain map: ~1.0 at the centre, ~4.0 near a corner at low sensor gain. */
+	/*
+	 * Gain map: ~1.0 at the centre, the table's gain at the shown area's corner (the sensor
+	 * corner, ~4.0, for 4:3 output; the 16:9 crop's corner, less vignetted, for 16:9).
+	 */
 	sensor_total_gain = 1.0;
+	sensor_crop(w, h);
+	double expect = synthetic_shading((crop_x + 1.0) / w, (crop_y + 1.0) / h, 4.0);
 	update_lsc(0.9, 0.45, w, h);
 	if (!lsc_active || lsc_pick[0] != 1 || lsc_strength != 1.0)
 		return 3;
-	double centre = lsc_map[1][OUT_HEIGHT / 2][OUT_WIDTH / 2] / 4096.0;
+	double centre = lsc_map[1][COL_HEIGHT / 2][COL_WIDTH / 2] / 4096.0;
 	double corner = lsc_map[0][0][0] / 4096.0;
-	if (centre < 0.98 || centre > 1.03 || corner < 3.7 || corner > 4.05)
+	if (centre < 0.98 || centre > 1.03 || fabs(corner - expect) > 0.15 || expect < 3.0)
 		return 4;
-	/* At 64x sensor gain the correction eases to 60%: 4^0.6 ~ 2.3 at the corner. */
+	/* At 64x sensor gain the correction eases to 60%: gain^0.6 at the corner. */
 	sensor_total_gain = 64.0;
 	update_lsc(0.9, 0.45, w, h);
 	corner = lsc_map[0][0][0] / 4096.0;
-	if (lsc_strength > 0.61 || corner < 2.1 || corner > 2.35)
+	if (lsc_strength > 0.61 || fabs(corner - pow(expect, 0.6)) > 0.1)
 		return 5;
 
 	/* A vignetted flat grey field (raw = flat / shading) comes out flat after correction. */
@@ -538,7 +545,7 @@ static int clipped_frame(unsigned int r, unsigned int g, unsigned int b, unsigne
 	tnr_reset();
 	if (convert_bayer_yuyv(frame, 64, 64, 128, out, sizeof(out), NULL))
 		return -1;
-	size_t at = (240 * OUT_WIDTH + 320) * 2;
+	size_t at = ((OUT_HEIGHT / 2) * OUT_WIDTH + OUT_WIDTH / 2) * 2;
 	*luma = out[at]; *u = out[at + 1] - 128; *v = out[at + 3] - 128;
 	return 0;
 }
@@ -950,7 +957,7 @@ static void rgbir_test_chroma(int mode, int radius, double gain, double *a, doub
 			int v = out[((size_t)y * OUT_WIDTH + x) * 2 + 3] - 128;
 			if (mode == 0) {
 				su += u; sv += v; n++;
-			} else if (x >= 310 && x <= 330) {
+			} else if (x >= OUT_WIDTH / 2 - 20 && x <= OUT_WIDTH / 2 + 20) {
 				if (abs(u) > mx) mx = abs(u);
 				if (abs(v) > mx) mx = abs(v);
 			}
@@ -973,8 +980,12 @@ static int test_noise_colour_bias(void)
 	rgbir_test_chroma(0, 2, 17.5, &u, &v);
 	if (fabs(u) > 1.0 || fabs(v) > 1.0)
 		return 1;
-	rgbir_test_chroma(0, 0, 17.5, &u, &v);	/* negative control */
-	if (u > -2.0 || v > -1.0)
+	/*
+	 * Negative control. Since the 1280x960 output each output pixel interpolates the colour
+	 * grid in linear light, which already halves this bias (was U -2.5 at 640x480).
+	 */
+	rgbir_test_chroma(0, 0, 17.5, &u, &v);
+	if (u > -0.8 || v > -0.8)
 		return 2;
 	return 0;
 }
@@ -985,15 +996,21 @@ static int test_edge_colour(void)
 	double hi, lo, unused;
 
 	rgbir_test_chroma(1, 2, 17.5, &lo, &unused);
+	chroma_guard = 0;	/* the window guard (boot-15) also fades this fringe */
 	rgbir_test_chroma(1, 0, 17.5, &hi, &unused);
+	chroma_guard = 1;
 	return lo <= 2 && hi >= lo + 3 ? 0 : 1;
 }
 
 /* Gain-scaled denoise steps. */
 static int test_gain_denoise_steps(void)
 {
-	if (chroma_radius_for_gain(4) != 2 || chroma_radius_for_gain(10) != 3 ||
-	    chroma_radius_for_gain(40) != 4)
+	/* Base radius scaled to the colour grid (2 cells of a 640-wide grid): 3 at 960, 1 at 320. */
+	int base = chroma_radius_scaled();
+	if (base != (COL_WIDTH >= 960 ? 3 : COL_WIDTH >= 640 ? 2 : 1))
+		return 4;
+	if (chroma_radius_for_gain(4) != base || chroma_radius_for_gain(10) != base + 1 ||
+	    chroma_radius_for_gain(40) != base + 2)
 		return 1;
 	if (tnr_threshold_for_gain(4) != TNR_THRESHOLD || tnr_threshold_for_gain(32) != 2 * TNR_THRESHOLD ||
 	    tnr_threshold_for_gain(100) != 2 * TNR_THRESHOLD)
@@ -1123,7 +1140,9 @@ static int run_rgbir_scene(const struct rgbir_scene *s, struct scene_result *r)
 	sensor_total_gain = saved_g;
 	memset(r, 0, sizeof(*r));
 	double n = 0, tn = 0;
-	unsigned int top_out = (unsigned int)((uint64_t)s->top_rows * OUT_HEIGHT / h);
+	/* Rows of the top band that the output shows (the 16:9 crop of the 4:3 frame: sensor_crop). */
+	unsigned int top_out = s->top_rows <= crop_y ? 0 :
+		(unsigned int)((uint64_t)(s->top_rows - crop_y) * OUT_HEIGHT / crop_h);
 	for (unsigned int oy = 0; oy < OUT_HEIGHT; oy++)
 		for (unsigned int ox = 0; ox < OUT_WIDTH; ox += 2) {
 			size_t at = ((size_t)oy * OUT_WIDTH + ox) * 2;
@@ -1193,6 +1212,58 @@ static int test_daylight_ir_grey(void)
 }
 
 /*
+ * 2026-11-21 (calibration shot, boot-23 vs Windows): the white point comes from the brightest
+ * regions a light could have lit. A bright grey (on this test locus) under a dimmer tinted top
+ * (0.13 off the locus on its green side, so still "a light", covering about 70% of the picture)
+ * stays neutral. Negative control: every region weighing its brightness once (the old rule)
+ * pulls the white point towards the tint and the grey goes off neutral.
+ */
+static int test_white_from_brightest(void)
+{
+	/* After removing the IR site: grey R/G 0.70, B/G 0.50 (on the locus); top 0.55, 0.45. */
+	struct rgbir_scene sc = { { 18 + 0.70 * 182, 200, 18 + 0.50 * 182, 18 },
+				  { 8 + 0.55 * 82, 90, 8 + 0.45 * 82, 8 }, 648, 0, 6.0, 2.0 };
+	struct scene_result r;
+	int result = 0;
+
+	if (load_test_locus())
+		return 1;
+	if (run_rgbir_scene(&sc, &r) || fabs(r.u) > 2 || fabs(r.v) > 2)
+		result = 2;
+	wb_bright_power = 0;
+	if (!result && (run_rgbir_scene(&sc, &r) || !(fabs(r.u) > 3 || fabs(r.v) > 3)))
+		result = 3;
+	wb_bright_power = 3.0;
+	restore_colour_defaults(nir_keep_q12[2], wb_locus_nir_band);
+	return result;
+}
+
+/*
+ * The calibration shot's red flag in window light (lens-shaded levels above black: R 188.9,
+ * G 128.5, B 79.5, IR 111.3; NIR about 1.4x its red, 6x its green) over the shot's white
+ * (306.7, 521.7, 319.3, 185.1; NIR 0.45 of green). Measured against the strongest colour, the
+ * red keeps its colour. Negative control: measured against green (as before) the colour guard
+ * fades it towards brown.
+ */
+static int test_red_keeps_colour_nir(void)
+{
+	struct rgbir_scene sc = { { 306.7, 521.7, 319.3, 185.1 }, { 188.9, 128.5, 79.5, 111.3 }, 972 / 2, 0, 6.0, 1.0 };
+	struct scene_result r, faded;
+	int result = 0;
+
+	if (load_test_locus())
+		return 1;
+	if (run_rgbir_scene(&sc, &r) || !(r.top_v > 25))
+		result = 2;
+	chroma_guard_strongest = 0;
+	if (!result && (run_rgbir_scene(&sc, &faded) || !(faded.top_v < r.top_v - 10)))
+		result = 3;
+	chroma_guard_strongest = 1;
+	restore_colour_defaults(nir_keep_q12[2], wb_locus_nir_band);
+	return result;
+}
+
+/*
  * Without NIR (LED room, boot-11: IR 18.9, G 178.5 at 17.5x, noisy) nothing changes: neutral,
  * and within 0.5 of the old full subtraction.
  */
@@ -1236,8 +1307,8 @@ static int test_green_side_light(void)
 		return 1;
 	if (run_rgbir_scene(&boot14_wall, &r) || fabs(r.u) > 2 || fabs(r.v) > 2)
 		result = 2;
-	else if (wb_locus_side <= 0.10 || wb_regions_used != wb_regions_valid || !wb_regions_valid)
-		result = 3;	/* really the boot-14 case: well off on the green side, all regions used */
+	else if (wb_locus_side <= 0.10 || !wb_regions_valid || wb_regions_used < 0.95 * wb_regions_valid)
+		result = 3;	/* really the boot-14 case: well off on the green side, (almost) all regions used */
 	wb_locus_green_band = 0;
 	if (!result && (run_rgbir_scene(&boot14_wall, &r) || !(r.u < -2 && r.v < -2)))
 		result = 4;
@@ -1263,8 +1334,9 @@ static int test_green_scene_not_light(void)
 		return 1;
 	if (run_rgbir_scene(&sc, &r) || fabs(r.u) > 2 || fabs(r.v) > 2)
 		result = 2;
-	else if (wb_regions_valid != 48 || wb_regions_used < 30 || wb_regions_used > 34)
-		result = 3;	/* the 16 top regions (and any straddling the edge) left out */
+	else if (wb_regions_valid != WB_REGIONS_X * WB_REGIONS_Y ||
+		 wb_regions_used < 0.55 * wb_regions_valid || wb_regions_used > 0.80 * wb_regions_valid)
+		result = 3;	/* the top regions (the foliage, and any straddling its edge) left out */
 	wb_locus_green_band = 0;	/* grey-world over the whole frame */
 	if (!result && (run_rgbir_scene(&sc, &r) || !(fabs(r.u) > 2 || fabs(r.v) > 2)))
 		result = 4;
@@ -1278,6 +1350,287 @@ static int test_green_scene_not_light(void)
 		result = 7;	/* pulled to the locus band, not trusted */
 	restore_colour_defaults(nir_keep_q12[2], wb_locus_nir_band);
 	return result;
+}
+
+/*
+ * 2026-11-20 (boot-15): output 1280x960 with brightness detail from the green sites; colour
+ * guard for NIR-dominated windows and for stripes; k_B 0.75.
+ */
+
+/* Grey vertical stripes (front RGB-IR levels), bright 1.7x and dark 0.3x, `period` sensor pixels. */
+static void stripe_frame(uint16_t *f, unsigned int w, unsigned int h, unsigned int period)
+{
+	static const double grey[4] = { 110, 170, 90, 17 };
+
+	for (unsigned int y = 0; y < h; y++)
+		for (unsigned int x = 0; x < w; x++)
+			f[(size_t)y * w + x] = (uint16_t)(BLACK_LEVEL +
+				grey[channel_at(x, y)] * (((x / (period / 2)) & 1) ? 1.7 : 0.3));
+}
+
+/* Centre half of the output: luma standard deviation and mean chroma magnitude. */
+static void centre_stats(const unsigned char *o, double *luma_sd, double *chroma)
+{
+	double s = 0, q = 0, n = 0, c = 0, cn = 0;
+
+	for (int y = OUT_HEIGHT / 4; y < OUT_HEIGHT * 3 / 4; y++)
+		for (int x = OUT_WIDTH / 4; x < OUT_WIDTH * 3 / 4; x += 2) {
+			size_t at = ((size_t)y * OUT_WIDTH + x) * 2;
+			for (int k = 0; k < 2; k++) {
+				double v = o[at + 2 * k];
+				s += v; q += v * v; n++;
+			}
+			c += hypot(o[at + 1] - 128, o[at + 3] - 128);
+			cn++;
+		}
+	*luma_sd = sqrt(q / n - (s / n) * (s / n));
+	*chroma = c / cn;
+}
+
+static int convert_stripes(unsigned int period, double *luma_sd, double *chroma)
+{
+	const unsigned int w = 2592, h = 1944;
+	static unsigned char out[OUT_FRAME_BYTES];
+	uint16_t *f = malloc((size_t)w * h * sizeof(*f));
+
+	if (!f)
+		return -1;
+	set_rgbir_pattern();
+	stripe_frame(f, w, h, period);
+	for (int k = 0; k < 3; k++) {
+		tnr_reset();
+		convert_bayer_yuyv(f, w, h, w * 2, out, sizeof(out), NULL);
+	}
+	free(f);
+	centre_stats(out, luma_sd, chroma);
+	return 0;
+}
+
+/*
+ * Resolution: stripes 4 sensor pixels apart (2 output pixels at 1280 wide) show in the output.
+ * Negative control: colour-grid brightness only (each output pixel from a 4x4 window, as the
+ * 640x480 output was) averages them away completely.
+ */
+static int test_detail_stripes(void)
+{
+	double sd, c, sd_off;
+	int result = 0;
+
+	if (load_test_locus() || convert_stripes(4, &sd, &c))
+		return 1;
+	detail_enabled = 0;
+	if (convert_stripes(4, &sd_off, &c))
+		result = 2;
+	detail_enabled = 1;
+	if (!result && !(sd > 15 && sd_off < 3))
+		result = 3;
+	restore_colour_defaults(nir_keep_q12[2], wb_locus_nir_band);
+	return result;
+}
+
+/*
+ * Window blinds: grey stripes 6 sensor pixels apart put green and magenta fringes into every
+ * 4x4 window (its 2 R and 2 B sites see other stripes than its greens). The stripe guard
+ * fades them; negative control without it.
+ */
+static int test_stripe_fringes(void)
+{
+	double sd, c, c_off;
+	int result = 0;
+
+	if (load_test_locus() || convert_stripes(6, &sd, &c))
+		return 1;
+	chroma_guard = 0;
+	if (convert_stripes(6, &sd, &c_off))
+		result = 2;
+	chroma_guard = 1;
+	if (!result && !(c < 9 && c_off > 18))
+		result = 3;
+	restore_colour_defaults(nir_keep_q12[2], wb_locus_nir_band);
+	return result;
+}
+
+/*
+ * The detail touches brightness only: on 12 colour patches (front RGB-IR, test locus) each
+ * patch's mean U and V are the same with and without it.
+ */
+static int test_detail_keeps_colour(void)
+{
+	const unsigned int w = 1296, h = 972;
+	static unsigned char out[2][OUT_FRAME_BYTES];
+	static const double patch[12][3] = {
+		{ 160, 60, 40 }, { 60, 160, 50 }, { 50, 70, 160 }, { 150, 150, 40 },
+		{ 40, 150, 150 }, { 150, 50, 150 }, { 120, 120, 120 }, { 60, 60, 60 },
+		{ 200, 130, 90 }, { 90, 130, 60 }, { 70, 90, 130 }, { 180, 180, 180 },
+	};
+	uint16_t *f = malloc((size_t)w * h * sizeof(*f));
+	unsigned int state = 3;
+	int result = 0;
+
+	if (!f || load_test_locus()) {
+		free(f);
+		return 1;
+	}
+	set_rgbir_pattern();
+	for (unsigned int y = 0; y < h; y++)
+		for (unsigned int x = 0; x < w; x++) {
+			const double *p = patch[(y * 3 / h) * 4 + x * 4 / w];
+			int ch = channel_at(x, y);
+			state = state * 1103515245u + 12345u;
+			double v = (ch == CFA_IR ? 0 : p[ch] * 0.9) + 0.1 * p[1] + ((state >> 16) % 9) - 4.0;
+			f[(size_t)y * w + x] = (uint16_t)(BLACK_LEVEL + v);
+		}
+	for (int pass = 0; pass < 2; pass++) {
+		detail_enabled = !pass;
+		for (int k = 0; k < 3; k++) {
+			tnr_reset();
+			convert_bayer_yuyv(f, w, h, w * 2, out[pass], OUT_FRAME_BYTES, NULL);
+		}
+	}
+	detail_enabled = 1;
+	free(f);
+	for (int b = 0; b < 12 && !result; b++) {
+		double du = 0, dv = 0, n = 0;
+		unsigned int bx = (unsigned int)(b % 4) * OUT_WIDTH / 4, by = (unsigned int)(b / 4) * OUT_HEIGHT / 3;
+		for (unsigned int y = by + 24; y < by + OUT_HEIGHT / 3 - 24; y++)
+			for (unsigned int x = bx + 24; x < bx + OUT_WIDTH / 4 - 24; x += 2) {
+				size_t at = ((size_t)y * OUT_WIDTH + x) * 2;
+				du += out[0][at + 1] - out[1][at + 1];
+				dv += out[0][at + 3] - out[1][at + 3];
+				n++;
+			}
+		if (fabs(du / n) > 0.6 || fabs(dv / n) > 0.6)
+			result = 2;
+	}
+	restore_colour_defaults(nir_keep_q12[2], wb_locus_nir_band);
+	return result;
+}
+
+/*
+ * Boot-15: a dark green T-shirt came out teal by the sunny window. Model: a dark green patch
+ * (visible R/G 0.3, B/G 0.35) that reflects 3x more NIR than visible green, over a daylight
+ * grey with NIR 0.4 of green; the sensor's blue NIR response is 0.75. With k_B 0.75 the patch
+ * stays green (U and V well below 0). Negative control: the old k_B 0.60 turns it teal (U > 0).
+ */
+static void nir_sites(double *o, double r, double g, double b, double n, double kb)
+{
+	o[0] = r + 0.1 * g + n;
+	o[1] = g + 0.1 * g + n;
+	o[2] = b + 0.1 * g + kb * n;
+	o[3] = 0.1 * g + n;
+}
+
+static int test_nir_dark_green(void)
+{
+	struct rgbir_scene sc = { { 0 }, { 0 }, 972 / 3, 0, 8.0, 2.0 };
+	struct scene_result r;
+	int keep = nir_keep_q12[2], result = 0;
+
+	nir_sites(sc.level, 75, 150, 97.5, 60, 0.75);
+	nir_sites(sc.top, 12, 40, 14, 120, 0.75);
+	if (load_test_locus() || run_rgbir_scene(&sc, &r))
+		return 1;
+	if (!(r.top_u < -8 && r.top_v < -6) || fabs(r.u) > 1.5 || fabs(r.v) > 1.5)
+		result = 2;
+	nir_keep_q12[2] = 1638;		/* k_B 0.60 */
+	if (!result && (run_rgbir_scene(&sc, &r) || !(r.top_u > 0)))
+		result = 3;
+	restore_colour_defaults(keep, wb_locus_nir_band);
+	return result;
+}
+
+/*
+ * The picture shows a centred sensor area with the output's aspect ratio (boot-18: the camera app
+ * needs a 16:9 size of 1280 or wider; the sensors are 4:3). Front 2592x1944 and rear 3280x2464.
+ */
+static int test_sensor_crop(void)
+{
+	static const unsigned int sensors[][2] = { { 2592, 1944 }, { 3280, 2464 }, { 1296, 972 } };
+
+	for (unsigned int i = 0; i < 3; i++) {
+		unsigned int w = sensors[i][0], h = sensors[i][1];
+		sensor_crop(w, h);
+		/* Aspect within one row/column of the output's, centred, inside the sensor. */
+		if (llabs((long long)crop_w * OUT_HEIGHT - (long long)crop_h * OUT_WIDTH) > (long long)2 * OUT_WIDTH ||
+		    crop_x + crop_w > w || crop_y + crop_h > h ||
+		    abs((int)(crop_x * 2 + crop_w) - (int)w) > 2 || abs((int)(crop_y * 2 + crop_h) - (int)h) > 2)
+			return 1 + (int)i;
+		/*
+		 * 4:3 output on a 4:3 sensor: (nearly) all of it (the 640x480 build; the rear's
+		 * 3280x2464 is a little wider than 4:3, so 4 rows go), else the full width.
+		 */
+		if ((uint64_t)OUT_WIDTH * 3 == (uint64_t)OUT_HEIGHT * 4) {
+			if (crop_w * 100 < w * 99 || crop_h * 100 < h * 99)
+				return 5;
+		} else if (crop_x || crop_w != w || crop_h >= h) {
+			return 6;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Boot-20: every rear session started ~2x overexposed and AE took over a second. Simulated sensor
+ * (the picture's mean follows the exposure x gain set two frames earlier): after ae_wake() a 2x
+ * overexposure is inside the deadband within 5 frames (4 here); the normal steps (negative control) need 8
+ * or more. In the fast phase a blown-out picture (clip fraction > 5%) at least halves exposure.
+ */
+static int ae_frames_to_settle(int wake, double start_over)
+{
+	struct ae_state ae;
+	double history[4];
+
+	ov5675_ae(&ae, 1);
+	ae.exposure.value = 2016;
+	ae.again.value = 512;	/* 4x: room to go both ways */
+	ae_frame_limits(&ae, 1944);
+	double t0 = ae_total(&ae), scene = AE_TARGET * start_over / t0;
+	for (int i = 0; i < 4; i++)
+		history[i] = t0;
+	if (wake)
+		ae_wake(&ae);
+	ae_clip_fraction = 0;
+	for (int frame = 1; frame <= 60; frame++) {
+		double mean = scene * history[0];	/* settings from two frames ago */
+		if (fabs(mean / AE_TARGET - 1.0) < AE_DEADBAND && frame > 2)
+			return frame;
+		ae_frame(&ae, mean);
+		history[0] = history[1];
+		history[1] = ae_total(&ae);
+	}
+	return 99;
+}
+
+static int test_ae_fast_start(void)
+{
+	int fast = ae_frames_to_settle(1, 2.0), slow = ae_frames_to_settle(0, 2.0);
+
+	if (fast > 5 || slow < 8)
+		return 1;
+	if (ae_frames_to_settle(1, 0.4) > 5)	/* underexposed start too */
+		return 2;
+	/* Clipped highlights in the fast phase: at least halve, even when the mean looks near target. */
+	struct ae_state ae;
+	ov5675_ae(&ae, 1);
+	ae.exposure.value = 2016;
+	ae.again.value = 512;
+	ae_frame_limits(&ae, 1944);
+	double before = ae_total(&ae);
+	ae_wake(&ae);
+	ae.fast = 2;
+	ae_clip_fraction = 0.3;
+	ae_update(&ae, AE_TARGET * 1.2);
+	int halved = ae_total(&ae) <= before * 0.51;
+	/* Normal phase: the clip fraction is ignored (1.2x over: one 1/1.2 step). */
+	ov5675_ae(&ae, 1);
+	ae.exposure.value = 2016;
+	ae.again.value = 512;
+	ae_frame_limits(&ae, 1944);
+	before = ae_total(&ae);
+	ae_update(&ae, AE_TARGET * 1.2);
+	int normal_ok = ae_total(&ae) > before * 0.8;
+	ae_clip_fraction = 0;
+	return halved ? (normal_ok ? 0 : 4) : 3;
 }
 
 /*
@@ -1692,6 +2045,132 @@ static int test_idle_restart_deadline(void)
 	return EXIT_IDLE_FAILED == 4 && EXIT_IDLE_FAILED != 3 ? 0 : 4;
 }
 
+
+/*
+ * The frame channel to the libcamera plugin (kernel/ipu6-channel.h), with a client doing what
+ * gbos_ipu6.cpp does: connect, take the hello and the memfd, read frames from the slots.
+ */
+static int channel_client(const char *name)
+{
+	struct sockaddr_un a;
+	socklen_t len = channel_address(name, &a);
+	int c = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+
+	if (c >= 0 && connect(c, (struct sockaddr *)&a, len)) {
+		close(c);
+		return -1;
+	}
+	return c;
+}
+
+static int channel_hello(int c, struct ipu6_channel_hello *h, int *memfd)
+{
+	char control[CMSG_SPACE(sizeof(int))];
+	struct iovec iov = { .iov_base = h, .iov_len = sizeof(*h) };
+	struct msghdr m = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = control,
+			    .msg_controllen = sizeof(control) };
+	struct pollfd p = { .fd = c, .events = POLLIN };
+
+	*memfd = -1;
+	if (poll(&p, 1, 2000) != 1 || recvmsg(c, &m, 0) != (ssize_t)sizeof(*h))
+		return -1;
+	for (struct cmsghdr *cm = CMSG_FIRSTHDR(&m); cm; cm = CMSG_NXTHDR(&m, cm))
+		if (cm->cmsg_type == SCM_RIGHTS)
+			memcpy(memfd, CMSG_DATA(cm), sizeof(int));
+	return *memfd >= 0 ? 0 : -1;
+}
+
+static int channel_frame(int c, struct ipu6_channel_frame *f)
+{
+	struct pollfd p = { .fd = c, .events = POLLIN };
+
+	return poll(&p, 1, 2000) == 1 && recv(c, f, sizeof(*f), 0) == (ssize_t)sizeof(*f) ? 0 : -1;
+}
+
+static int test_frame_channel(void)
+{
+	static unsigned char frame[OUT_FRAME_BYTES];
+	struct out_sink s, other;
+	struct ipu6_channel_hello h;
+	struct ipu6_channel_frame meta = { 0 }, f;
+	char name[64], dev[80];
+	int memfd, c1, c2;
+
+	snprintf(name, sizeof(name), "test-%d", (int)getpid());
+	snprintf(dev, sizeof(dev), "channel:%s", name);
+	if (!sink_open(&other, "channel:") || !sink_open(&other, "channel:a/b"))
+		return 1;
+	sink_close(&other);
+	if (sink_open(&s, dev) || !s.channel || sink_event_fd(&s) != -1)
+		return 2;
+	if (!sink_open(&other, dev))	/* a second bridge on the same camera */
+		return 3;
+	sink_close(&other);
+	if (sink_readers(&s) != 0)
+		return 4;
+	/* Stopped bridge: a connection ends the wait at once and counts as a reader. */
+	c1 = channel_client(name);
+	double t0 = monotonic_s();
+	if (c1 < 0 || sink_wait(&s, 1000) || monotonic_s() - t0 > 0.5 || sink_readers(&s) != 1)
+		return 5;
+	if (channel_hello(c1, &h, &memfd) || h.magic != IPU6_CHANNEL_MAGIC || h.width != OUT_WIDTH ||
+	    h.height != OUT_HEIGHT || h.slots != IPU6_CHANNEL_SLOTS ||
+	    h.slot_bytes < OUT_FRAME_BYTES || h.header_bytes < sizeof(struct ipu6_channel_shared) ||
+	    h.map_bytes < h.header_bytes + (uint64_t)h.slots * h.slot_bytes)
+		return 6;
+	unsigned char *map = mmap(NULL, h.map_bytes, PROT_READ, MAP_SHARED, memfd, 0);
+	close(memfd);
+	if (map == MAP_FAILED)
+		return 7;
+	const struct ipu6_channel_shared *sh = (const void *)map;
+	for (unsigned int k = 1; k <= 6; k++) {
+		memset(frame, (int)(k * 37), sizeof(frame));
+		frame[k] = 1;
+		meta.exposure_us = (int32_t)(1000 + k);
+		meta.timestamp_ns = (int64_t)k * 33333333;
+		if (sink_write(&s, frame, &meta) || channel_frame(c1, &f))
+			return 8;
+		const unsigned char *slot = map + h.header_bytes + (size_t)f.slot * h.slot_bytes;
+		if (f.magic != IPU6_CHANNEL_MAGIC || f.seq != k || f.slot != (k - 1) % IPU6_CHANNEL_SLOTS ||
+		    f.exposure_us != (int32_t)(1000 + k) || f.timestamp_ns != (int64_t)k * 33333333 ||
+		    __atomic_load_n(&sh->seq[f.slot], __ATOMIC_ACQUIRE) != k ||
+		    memcmp(slot, frame, OUT_FRAME_BYTES))
+			return 9;
+	}
+	if (sink_readers(&s) != 1)
+		return 10;
+	/* A new connection (the camera service restarted) replaces the old one; seq starts over. */
+	c2 = channel_client(name);
+	if (c2 < 0 || sink_readers(&s) != 1 || channel_hello(c2, &h, &memfd))
+		return 11;
+	close(memfd);
+	char byte;
+	struct pollfd p = { .fd = c1, .events = POLLIN };
+	if (poll(&p, 1, 1000) != 1 || recv(c1, &byte, 1, 0) != 0)
+		return 12;
+	close(c1);
+	if (sink_write(&s, frame, &meta) || channel_frame(c2, &f) || f.seq != 1)
+		return 13;
+	/* A client that does not read: frames are dropped, the bridge never blocks. */
+	t0 = monotonic_s();
+	for (int k = 0; k < 2000; k++)
+		sink_write(&s, frame, &meta);
+	if (monotonic_s() - t0 > 20 || sink_readers(&s) != 1)
+		return 14;
+	close(c2);
+	if (sink_readers(&s) != 0)
+		return 15;
+	/* Nobody connected: writes are no-ops. */
+	if (sink_write(&s, frame, &meta))
+		return 16;
+	munmap(map, h.map_bytes);
+	sink_close(&s);
+	if (s.fd != -1 || s.map)
+		return 17;
+	return 0;
+}
+
+#ifndef IPU6_LOOPBACK_TEST_LIB	/* tools/test_ipu6_gpu.c reuses the helpers above */
 int main(void)
 {
 	(void)capture_to_loopback;
@@ -1722,6 +2201,10 @@ int main(void)
 		return 250 + test_autofocus();
 	{
 		int r;
+		if ((r = test_white_from_brightest()))
+			return printf("test_white_from_brightest %d\n", r), 1;
+		if ((r = test_red_keeps_colour_nir()))
+			return printf("test_red_keeps_colour_nir %d\n", r), 1;
 		if ((r = test_daylight_ir_grey()))
 			return printf("test_daylight_ir_grey %d\n", r), 260 + r;
 		if ((r = test_lowlight_led_grey()))
@@ -1730,6 +2213,18 @@ int main(void)
 			return printf("test_green_side_light %d\n", r), 1;
 		if ((r = test_green_scene_not_light()))
 			return printf("test_green_scene_not_light %d\n", r), 1;
+		if ((r = test_ae_fast_start()))
+			return printf("test_ae_fast_start %d\n", r), 1;
+		if ((r = test_sensor_crop()))
+			return printf("test_sensor_crop %d\n", r), 1;
+		if ((r = test_detail_stripes()))
+			return printf("test_detail_stripes %d\n", r), 1;
+		if ((r = test_stripe_fringes()))
+			return printf("test_stripe_fringes %d\n", r), 1;
+		if ((r = test_detail_keeps_colour()))
+			return printf("test_detail_keeps_colour %d\n", r), 1;
+		if ((r = test_nir_dark_green()))
+			return printf("test_nir_dark_green %d\n", r), 1;
 		if ((r = test_clipped_sky()))
 			return printf("test_clipped_sky %d\n", r), 280 + r;
 		if ((r = test_soft_clip()))
@@ -1748,6 +2243,8 @@ int main(void)
 			return printf("test_idle_watchdog %d\n", r), 1;
 		if ((r = test_idle_restart_deadline()))
 			return printf("test_idle_restart_deadline %d\n", r), 1;
+		if ((r = test_frame_channel()))
+			return printf("test_frame_channel %d\n", r), 1;
 	}
 	if (test_no_cfa_grid())
 		return 40 + test_no_cfa_grid();
@@ -1841,3 +2338,4 @@ int main(void)
 	puts("IPU6_LOOPBACK_TEST_PASS");
 	return 0;
 }
+#endif
