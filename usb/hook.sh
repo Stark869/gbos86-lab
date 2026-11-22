@@ -21,7 +21,7 @@ if [ ! -c /dev/null ]; then
 fi
 
 # Updater lab test (branch lab/updater-test only, never on main): the published test update changes this number
-log "hook: gbOS86 lab marker 4"
+log "hook: gbOS86 lab marker 5"
 
 # Reset one-shot MODE=live back to MODE=ask so subsequent boots prompt the user
 if [ -f "$G/gbos.cfg" ] && grep -q '^MODE=live' "$G/gbos.cfg" 2>/dev/null; then
