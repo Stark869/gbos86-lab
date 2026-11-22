@@ -1445,3 +1445,20 @@ SHA-NI, 256-bit VAES/VPCLMULQDQ, AVX-IFMA and AVX-512; the lapis binaries use th
   `publish_system_update.sh` used to carry on after that refusal (the build's exit status was lost in a pipe): it now stops and removes
   the half-made release (test added).
 
+- 2026-11-22 **Updater: staging failed on the persistent stick (read-only update.inbox); new way to write GBOSSYS from Android
+  (PC and container only, not on hardware).** The app's "Download and install" on lab update 202611212051 failed: `mkdir:
+  can't create directory '/postinstall/gbos/update.inbox': Read-only file system`. The namespace re-run (3558f76) works with
+  the stick's own busybox on a real kernel (privileged container, the same mounts the lockdown makes), so the hardware cause is
+  **not proven**. The boot's logs were lost to FAT damage. Two candidates: (1) the kernel made the FAT itself read-only after a FAT
+  error that boot (`errors=remount-ro`; the same session damaged the logs), which no remount of a bind can undo; (2) something
+  Android-specific broke the namespace re-run. Now stage0 makes `/dev/gbos-rw/stick` (hook.sh `gbos_root_rw`: a rw, nosuid, nodev,
+  noexec bind of `/gbos` inside a 0700 root directory on /dev) and sysupdate.sh writes through it, with no namespace. It keeps the
+  namespace re-run only for older hooks. It probes with a real mkdir (busybox `test -w` is always true for root, so the old check
+  could never fail). It refuses with the reason ("FAT is read-only for everyone" / "stayed read-only in its own namespace" / "no
+  /dev/gbos-rw"). It logs mount lines and its choice to `logs/boot-N/sysupdate.txt` on every stage/cancel/boot-ok, and to
+  `updater-app.txt` every boot. `request` no longer re-runs itself: its stage and cancel children choose for themselves, so their
+  errors reach the app. `tools/test_postinstall_ro.sh` (kernel part) runs `sysupdate.sh cancel`/`boot-ok` as init does (empty
+  environment, `/postinstall/busybox sh`): through /dev/gbos-rw, then through the namespace fallback, then with the FAT superblock
+  read-only. It also checks that uid 10123 and 1000 cannot reach `/dev/gbos-rw/stick`. To try it, the stick needs the new `hook.sh`
+  and `sysupdate.sh`; staging through the old copy cannot work.
+
