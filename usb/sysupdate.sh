@@ -1017,6 +1017,8 @@ cmd_install_app() {
   # never opened, it stayed in the NEVER standby bucket, so its jobs (the check after start, the cleanup) did not run on time
   # (JobScheduler "still in NEVER bucket", "0 EJ quota" after each reinstall, boots 16-19, 2026-11-24).
   cmd deviceidle whitelist +"$SU_PKG" >> "$_log" 2>&1 || echo "deviceidle whitelist +$SU_PKG failed" >> "$_log"
+  # The Settings entry (hook.sh gbos_settings_updater_entry): is the static overlay of Settings known and enabled? ([x] = enabled)
+  { echo "overlays of com.android.settings:"; cmd overlay list com.android.settings 2>&1 | head -n 20; } >> "$_log" 2>&1
   # the app's update check at startup (its own BOOT_COMPLETED receiver does not run until the app was opened once). The app decides
   # (Settings: "Check when the laptop starts") and waits for the network itself.
   am broadcast -a org.gbos86.updater.BOOT_CHECK -n "$SU_PKG/.BootReceiver" -f 0x20 >> "$_log" 2>&1

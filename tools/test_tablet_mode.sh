@@ -49,11 +49,14 @@ EOF
 diff -u "$T/expected" "$T/switches"
 [ "$(tm_tablet_device)" = /dev/input/event21 ] || fail "tablet device not found"
 
-# getevent -qS stub: "<device>: <bits>"
+# getevent -qS stub. Android's toolbox prints only the bits for one device ("0002", seen on every Latitude
+# boot); GETEVENT_PREFIX=1 also checks a "<device>: <bits>" form.
 GETEVENT_BITS=0002
+GETEVENT_PREFIX=0
 getevent() {
   [ "$1" = -qS ] || return 1
-  [ -n "$GETEVENT_BITS" ] && printf '%s: %s\n' "$2" "$GETEVENT_BITS"
+  [ -n "$GETEVENT_BITS" ] || return 0
+  if [ "$GETEVENT_PREFIX" = 1 ]; then printf '%s: %s\n' "$2" "$GETEVENT_BITS"; else printf '%s\n' "$GETEVENT_BITS"; fi
   return 0
 }
 [ "$(tm_tablet_state /dev/input/event21)" = 1 ] || fail "SW_TABLET_MODE=1 not parsed"
@@ -61,6 +64,11 @@ GETEVENT_BITS=0003
 [ "$(tm_tablet_state /dev/input/event21)" = 1 ] || fail "lid+tablet bits not parsed"
 GETEVENT_BITS=0001
 [ "$(tm_tablet_state /dev/input/event21)" = 0 ] || fail "lid-only bits read as tablet"
+GETEVENT_PREFIX=1 GETEVENT_BITS=0002
+[ "$(tm_tablet_state /dev/input/event21)" = 1 ] || fail "prefixed SW_TABLET_MODE=1 not parsed"
+GETEVENT_BITS=0000
+[ "$(tm_tablet_state /dev/input/event21)" = 0 ] || fail "prefixed cover-attached bits not parsed"
+GETEVENT_PREFIX=0
 GETEVENT_BITS=
 [ "$(tm_tablet_state /dev/input/event21)" = unknown ] || fail "empty getevent output not unknown"
 [ "$(tm_tablet_state '')" = unknown ] || fail "missing device not unknown"

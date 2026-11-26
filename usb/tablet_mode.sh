@@ -54,11 +54,12 @@ tm_switch_devices() {
 
 tm_tablet_device() { tm_switch_devices | awk '$2 ~ /tablet/ { print $1; exit }'; }
 
-# 1 (tablet), 0 (cover attached) or "unknown". getevent -qS prints "<device>: <hex switch bits>".
+# 1 (tablet), 0 (cover attached) or "unknown" from the hex switch bits getevent -qS prints.
 tm_tablet_state() {
   _dev=${1:-$(tm_tablet_device)}
   [ -n "$_dev" ] || { echo unknown; return 0; }
-  _bits=$(getevent -qS "$_dev" 2>/dev/null | sed -n 's/^.*:[[:space:]]*\([0-9a-fA-F]\{1,8\}\)[[:space:]]*$/\1/p' | tail -n 1)
+  # Android's toolbox prints only the bits ("0002") for one device; accept an optional "<device>: " prefix too.
+  _bits=$(getevent -qS "$_dev" 2>/dev/null | sed -n 's/^\(.*:\)\{0,1\}[[:space:]]*\([0-9a-fA-F]\{1,8\}\)[[:space:]]*$/\2/p' | tail -n 1)
   [ -n "$_bits" ] || { echo unknown; return 0; }
   case $(printf '%s' "$_bits" | tail -c 1) in
     2|3|6|7|a|b|e|f|A|B|E|F) echo 1 ;;
