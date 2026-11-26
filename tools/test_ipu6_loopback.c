@@ -1194,7 +1194,9 @@ static int test_daylight_ir_grey(void)
 	else if (wb_nir_ratio < 0.35 || wb_nir_ratio > 0.5 || wb_locus_distance > wb_locus_band)
 		result = 3;	/* NIR ~0.43 of green; within the (widened) band */
 	wb_locus_green_band = 0;
-	/* Negative control: no blue NIR term, fixed band. */
+	/* Negative control: no blue (and no red) NIR term, fixed band. */
+	int keep_r = nir_keep_q12[0];
+	nir_keep_q12[0] = 0;
 	nir_keep_q12[2] = 0;
 	wb_locus_nir_band = 0;
 	if (!result && (run_rgbir_scene(&sc, &r) || (fabs(r.u) <= 2 && fabs(r.v) <= 2)))
@@ -1207,6 +1209,7 @@ static int test_daylight_ir_grey(void)
 	wb_locus_nir_band = band;
 	if (!result && (run_rgbir_scene(&sc, &r) || (fabs(r.u) <= 2 && fabs(r.v) <= 2)))
 		result = 6;
+	nir_keep_q12[0] = keep_r;
 	restore_colour_defaults(keep, band);
 	return result;
 }
@@ -1259,6 +1262,36 @@ static int test_red_keeps_colour_nir(void)
 	if (!result && (run_rgbir_scene(&sc, &faded) || !(faded.top_v < r.top_v - 10)))
 		result = 3;
 	chroma_guard_strongest = 1;
+	restore_colour_defaults(nir_keep_q12[2], wb_locus_nir_band);
+	return result;
+}
+
+/*
+ * 2026-11-26 (boot-24, kitchen by a window, front camera, user's Windows photo of the same scene):
+ * levels above black, unshaded, of the white tiles (R 261.1, G 421.2, B 246.8, IR 102.9; NIR 0.17
+ * of green) and of a yellow banana (240.6, 316.7, 156.0, 127.7; NIR 0.34). With red's NIR response
+ * equal to the IR site's (keep 0) the banana loses its red and leans green (render hue 50 deg,
+ * Windows 41.5); with the red keep (k_R 0.85) it is yellow-orange and the tiles stay neutral.
+ * Negative control: keep 0 gives a smaller V for the banana.
+ */
+static int test_banana_keeps_red_nir(void)
+{
+	struct rgbir_scene sc = { { 261.1, 421.2, 246.8, 102.9 }, { 240.6, 316.7, 156.0, 127.7 }, 972 / 2, 0, 6.0, 1.0 };
+	struct scene_result r, old;
+	int keep_r = nir_keep_q12[0], result = 0;
+
+	if (load_test_locus())
+		return 1;
+	if (run_rgbir_scene(&sc, &r))
+		result = 2;
+	nir_keep_q12[0] = 0;
+	if (!result && run_rgbir_scene(&sc, &old))
+		result = 3;
+	nir_keep_q12[0] = keep_r;
+	if (!result && (fabs(r.u) > 2 || fabs(r.v) > 2))
+		result = 4;	/* the tiles stay neutral */
+	else if (!result && !(r.top_v > 14 && r.top_v > old.top_v + 3))
+		result = 5;	/* the banana keeps its red (V ~15.5 vs 11.6 with keep 0) */
 	restore_colour_defaults(nir_keep_q12[2], wb_locus_nir_band);
 	return result;
 }
@@ -1514,7 +1547,7 @@ static int test_detail_keeps_colour(void)
  */
 static void nir_sites(double *o, double r, double g, double b, double n, double kb)
 {
-	o[0] = r + 0.1 * g + n;
+	o[0] = r + 0.1 * g + 0.85 * n;	/* red's NIR response 0.85 (2026-11-26) */
 	o[1] = g + 0.1 * g + n;
 	o[2] = b + 0.1 * g + kb * n;
 	o[3] = 0.1 * g + n;
@@ -1637,7 +1670,7 @@ static int test_ae_fast_start(void)
  * Clipped highlights come out white, not pink. The daylit sky: green saturates (here at raw
  * 920, below full scale, as a sensor can) while R and B, under white-balance gains of ~1.85,
  * do not. Negative control: the fade keyed to full scale (clip detection off) leaves pink
- * (U +5, V +4 here).
+ * (U +5, V +1 here; V +4 before red's NIR keep of 2026-11-26).
  */
 static int test_clipped_sky(void)
 {
@@ -1659,7 +1692,7 @@ static int test_clipped_sky(void)
 	else if (fabs(r.u) > 2 || fabs(r.v) > 2)
 		result = 4;
 	clip_detect = 0;
-	if (!result && (run_rgbir_scene(&sc, &r) || !(r.top_u > 2 && r.top_v > 2)))
+	if (!result && (run_rgbir_scene(&sc, &r) || !(r.top_u > 2 && r.top_v > 0)))
 		result = 5;	/* negative control: magenta (U > 0 and V > 0) */
 	restore_colour_defaults(nir_keep_q12[2], wb_locus_nir_band);
 	return result;
@@ -2203,6 +2236,8 @@ int main(void)
 		int r;
 		if ((r = test_white_from_brightest()))
 			return printf("test_white_from_brightest %d\n", r), 1;
+		if ((r = test_banana_keeps_red_nir()))
+			return printf("test_banana_keeps_red_nir %d\n", r), 1;
 		if ((r = test_red_keeps_colour_nir()))
 			return printf("test_red_keeps_colour_nir %d\n", r), 1;
 		if ((r = test_daylight_ir_grey()))

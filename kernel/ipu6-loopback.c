@@ -314,7 +314,18 @@ static int ir_visible_q12 = 410;		/* 0.10 */
  * that teal). At 0.75 boot-12's daylight frames sit on the locus (0.00-0.03; at 0.60 they were
  * 0.04 on the magenta side), boot-8's 0.07 on the green side, within the green-side zone.
  */
-static int nir_keep_q12[3] = { 0, 0, 1024 };	/* R, G: k = 1; B: k = 0.75 */
+/*
+ * 2026-11-26 (boot-23/24 raw dumps vs the user's Windows photos of the same scenes): k_R = 0.85,
+ * not 1. With red at 1, objects that reflect much more NIR than the room's white lost their red:
+ * an orange wood trim (NIR 0.35-0.42 of green, the white ceiling 0.18) had the ceiling's raw R/G
+ * after the subtraction and rendered yellow-green (hue 52-70 deg, Windows 22), a kitchen banana
+ * 50 deg (Windows 41.5) and the forehead 23 (Windows 16). At 0.85: 48, 44 and 18; greys stay
+ * neutral, and light without NIR (lamps, LEDs) is unchanged. It is a compromise: sunlit foliage
+ * (boot-25's palm, NIR 0.46) moves from 115 to 98 deg (at 0.8: 89, yellow-green), and at 0.7
+ * boot-25's daylight skin goes from R/G 1.28 to 1.56. Materials differ, so no one constant
+ * matches every one (Intel's AIQ has a separate IR tuning, IRVI, not decoded).
+ */
+static int nir_keep_q12[3] = { 614, 0, 1024 };	/* R: k = 0.85; G: k = 1; B: k = 0.75 */
 
 
 static int nir_estimate(int ir, int green)
