@@ -973,8 +973,8 @@ static unsigned char clamp8(int value)
 static int chroma_radius = 2;		/* colour averaged over (2r+1)^2 output pixels; 0 = per pixel */
 #define TNR_THRESHOLD 14		/* luma steps (0..255) still treated as noise */
 /*
- * Above HIGH_GAIN_X total sensor gain the colour neighbourhood grows by one step at
- * HIGH_GAIN_X and another at 2 x HIGH_GAIN_X (5x5 -> 7x7 -> 9x9), the temporal luma
+ * The colour neighbourhood grows with gain (chroma_radius_for_gain: from 2x up, since
+ * 2026-11-26). Above HIGH_GAIN_X total sensor gain the temporal luma
  * threshold grows with the square root of the gain (noise does), up to 2x, and colour is
  * faded out across strong luma edges, where the 4x4 window straddles the edge and its
  * R, B and G sites see different sides (purple/green speckle on 2026-11-18 boot-11).
@@ -996,11 +996,21 @@ static int chroma_radius_scaled(void)
 	return r < 1 ? 1 : r;
 }
 
+/*
+ * 2026-11-26 (boot-24 raw dumps vs the user's Windows photos): colour blotches (8-30 px green/
+ * magenta patches) were about twice Windows' at gain 6-62, because the neighbourhood only grew
+ * above 8x. Now one step at each of gains 2, 4, 8, 16 and 32 (steps in cells of a 960-wide grid,
+ * scaled to this grid): blotches about 40% lower on the kitchen (6x), bathroom (8x) and dim room
+ * (62x) frames, a flat wall's fine colour noise 0.81 -> 0.56, without visible colour bleeding at
+ * the fruit or glasses edges. The box filter is O(r) per point on the GPU, cheap at r 8.
+ */
 static int chroma_radius_for_gain(double gain)
 {
 	if (chroma_radius <= 0)
 		return 0;
-	return chroma_radius_scaled() + (gain > HIGH_GAIN_X) + (gain > 2 * HIGH_GAIN_X);
+	int steps = (gain > 2) + (gain > 4) + (gain > HIGH_GAIN_X) + (gain > 2 * HIGH_GAIN_X) +
+		    (gain > 4 * HIGH_GAIN_X);
+	return chroma_radius_scaled() + (steps * COL_WIDTH + 480) / 960;
 }
 
 static int tnr_threshold_for_gain(double gain)
@@ -1280,12 +1290,88 @@ static void rgb_linear_at(const uint16_t *raw, unsigned int width, unsigned int 
  * (2r+1)^2 average; near strong luma edges those ratios are pulled towards grey. The result
  * goes to col_y/col_u/col_v.
  */
-struct mix_job { int r, edges; };
+struct mix_job { int r, edges, luma_nr; };
+
+/*
+ * Luma noise at high gain (2026-11-26, boot-24 dim room at 62x vs the user's Windows photo: fine
+ * speckle 7.1 vs 3.4, a flat wall 11.0). Each colour-grid point's luminance is averaged with the
+ * 5x5 points around it whose luminance lies within the noise expected at its level (shot noise:
+ * threshold ~ sqrt(level)); points further off weigh half up to twice that, then nothing, so
+ * edges stay. A point with almost no such neighbour is a speck and takes its 8 neighbours'
+ * median. Strength luma_nr = (k^2 x 10000 / 1024) for the threshold k x sqrt(level), k rising
+ * from 0 at HIGH_GAIN_X to LUMA_NR_K at 4 x HIGH_GAIN_X. Integer arithmetic throughout, so the
+ * GPU (mix.comp) gives the same values. With DETAIL_MIN 0.15: speckle 7.1 -> 3.0, wall 11.0 -> 3.7.
+ */
+#define LUMA_NR_K 8.0
+#define LUMA_NR_RADIUS 2
+#define LUMA_NR_SPECK 10	/* weight (x2, the point itself counts 2) below which a point is a speck */
+static int luma_nr_enabled = 1;	/* 0: off (host-test negative control) */
+
+static int luma_nr_for_gain(double gain)
+{
+	if (!luma_nr_enabled)
+		return 0;
+	double t = (gain - HIGH_GAIN_X) / (3 * HIGH_GAIN_X);
+	t = t < 0 ? 0 : t > 1 ? 1 : t;
+	double k = LUMA_NR_K * t;
+	return (int)(k * k * 10000.0 / 1024.0 + 0.5);
+}
+
+/* Linear luminance x 10000 of each colour-grid point (fits 32 bits: 10000 x 4 x LINEAR_MAX). */
+static int lum_plane[COL_HEIGHT][COL_WIDTH];
+
+static void lum_plane_rows(void *ctx, unsigned int row0, unsigned int row1)
+{
+	(void)ctx;
+	for (unsigned int y = row0; y < row1; y++)
+		for (unsigned int x = 0; x < COL_WIDTH; x++)
+			lum_plane[y][x] = 2126 * lin_plane[0][y][x] + 7152 * lin_plane[1][y][x] + 722 * lin_plane[2][y][x];
+}
+
+static int grid_lum(int x, int y)
+{
+	return lum_plane[y][x];
+}
+
+/* The luminance (x 10000) of point ox, oy after the luma noise filter of strength nr (> 0). */
+static int luma_nr_at(int ox, int oy, int nr)
+{
+	int y0 = grid_lum(ox, oy);
+	int thr2 = nr * ((y0 > 0 ? y0 : 0) >> 10);	/* threshold^2 in (lum >> 10)^2 units */
+	if (thr2 < 1)
+		thr2 = 1;
+	int wsum = 0, tsum = 0;
+	for (int dy = -LUMA_NR_RADIUS; dy <= LUMA_NR_RADIUS; dy++)
+		for (int dx = -LUMA_NR_RADIUS; dx <= LUMA_NR_RADIUS; dx++) {
+			int x = ox + dx, y = oy + dy;
+			if (x < 0 || x >= COL_WIDTH || y < 0 || y >= COL_HEIGHT)
+				continue;
+			int yn = grid_lum(x, y), d = (yn - y0) >> 10;
+			d = d < -40000 ? -40000 : d > 40000 ? 40000 : d;	/* d * d within 32 bits */
+			int d2 = d * d, w = d2 < thr2 ? 2 : d2 < 4 * thr2 ? 1 : 0;
+			wsum += w;
+			tsum += w * (yn >> 4);
+		}
+	if (wsum >= LUMA_NR_SPECK)
+		return (tsum / wsum) << 4;
+	int v[8], n = 0;
+	for (int dy = -1; dy <= 1; dy++)
+		for (int dx = -1; dx <= 1; dx++) {
+			int x = ox + dx, y = oy + dy;
+			if ((dx || dy) && x >= 0 && x < COL_WIDTH && y >= 0 && y < COL_HEIGHT)
+				v[n++] = grid_lum(x, y);
+		}
+	for (int i = 1; i < n; i++)
+		for (int j = i; j > 0 && v[j] < v[j - 1]; j--) {
+			int t = v[j]; v[j] = v[j - 1]; v[j - 1] = t;
+		}
+	return n & 1 ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2;	/* luminance >= 0: fits 32 bits */
+}
 
 static void linear_colour_mix_rows(void *ctx, unsigned int row0, unsigned int row1)
 {
 	const struct mix_job *job = ctx;
-	int r = job->r, edges = job->edges;
+	int r = job->r, edges = job->edges, luma_nr = job->luma_nr;
 
 	for (int oy = (int)row0; oy < (int)row1; oy++)
 		for (int ox = 0; ox < COL_WIDTH; ox++) {
@@ -1294,6 +1380,8 @@ static void linear_colour_mix_rows(void *ctx, unsigned int row0, unsigned int ro
 			int c[3];
 			int64_t ylin = 2126LL * lr + 7152LL * lg + 722LL * lb;	/* x 10000 */
 			int64_t yavg = 2126LL * ar + 7152LL * ag + 722LL * ab;
+			if (luma_nr > 0 && r > 0 && yavg > 0)
+				ylin = luma_nr_at(ox, oy, luma_nr);
 			if (r == 0 || yavg <= 0) {
 				c[0] = lr; c[1] = lg; c[2] = lb;
 			} else {
@@ -1372,7 +1460,10 @@ static void run_bands(void (*fn)(void *, unsigned int, unsigned int), void *ctx,
 
 static void linear_colour_mix(int r, double gain)
 {
-	struct mix_job job = { r, r > 0 && gain > HIGH_GAIN_X };
+	struct mix_job job = { r, r > 0 && gain > HIGH_GAIN_X, luma_nr_for_gain(gain) };
+
+	if (job.luma_nr > 0 && r > 0)
+		run_bands(lum_plane_rows, NULL, COL_HEIGHT);
 
 	for (int c = 0; c < 3; c++) {
 		memcpy(lin_avg[c], lin_plane[c], sizeof(lin_avg[c]));
@@ -1393,7 +1484,7 @@ static void linear_colour_mix(int r, double gain)
  */
 #define DETAIL_FULL_GAIN 8.0
 #define DETAIL_MIN_GAIN 32.0
-#define DETAIL_MIN 0.4
+#define DETAIL_MIN 0.15	/* 2026-11-26: was 0.4; the dark specks at 62x (see luma_nr_for_gain) */
 #define DETAIL_LUT_MAX 1024	/* ratio 0..4 in steps of 1/256 */
 static int detail_enabled = 1;	/* 0: colour-grid brightness only (host-test negative control) */
 static uint16_t detail_lut[DETAIL_LUT_MAX + 1];	/* Q12 factor for Y' */

@@ -25,6 +25,7 @@ layout(std430, binding = 0) readonly buffer Params {
 	int cfa[16];				// channel of site (y & 3) * 4 + (x & 3): 0 R, 1 G, 2 B, 3 IR
 	int cfa_count[4];
 	int crop_x, crop_y, crop_w, crop_h;	/* sensor area shown (sensor_crop) */
+	int luma_nr;				/* luma_nr_for_gain; 0 = off */
 } P;
 
 layout(std430, binding = 1) readonly buffer Raw { uint raw[]; };		// uint16 pairs

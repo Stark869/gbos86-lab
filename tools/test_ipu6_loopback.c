@@ -1009,9 +1009,21 @@ static int test_gain_denoise_steps(void)
 	int base = chroma_radius_scaled();
 	if (base != (COL_WIDTH >= 960 ? 3 : COL_WIDTH >= 640 ? 2 : 1))
 		return 4;
-	if (chroma_radius_for_gain(4) != base || chroma_radius_for_gain(10) != base + 1 ||
-	    chroma_radius_for_gain(40) != base + 2)
+	/*
+	 * 2026-11-26: one step more at each of gains 2, 4, 8, 16, 32 (was 8, 16), in 960-grid cells,
+	 * so 1920-wide output: 3, 4, 5, 6, 7, 8; smaller grids scale the steps (same sensor area).
+	 */
+	if (COL_WIDTH == 960 &&
+	    (chroma_radius_for_gain(1.5) != base || chroma_radius_for_gain(3) != base + 1 ||
+	     chroma_radius_for_gain(6) != base + 2 || chroma_radius_for_gain(10) != base + 3 ||
+	     chroma_radius_for_gain(20) != base + 4 || chroma_radius_for_gain(62) != base + 5))
 		return 1;
+	if (chroma_radius_for_gain(1.5) != base || chroma_radius_for_gain(62) <= base ||
+	    chroma_radius_for_gain(62) > base + (5 * COL_WIDTH + 480) / 960)
+		return 5;
+	for (double g = 1; g < 100; g *= 1.5)
+		if (chroma_radius_for_gain(g * 1.5) < chroma_radius_for_gain(g))
+			return 6;
 	if (tnr_threshold_for_gain(4) != TNR_THRESHOLD || tnr_threshold_for_gain(32) != 2 * TNR_THRESHOLD ||
 	    tnr_threshold_for_gain(100) != 2 * TNR_THRESHOLD)
 		return 2;
@@ -1437,6 +1449,84 @@ static int convert_stripes(unsigned int period, double *luma_sd, double *chroma)
 	free(f);
 	centre_stats(out, luma_sd, chroma);
 	return 0;
+}
+
+/*
+ * 2026-11-26: luma noise at high gain (luma_nr_for_gain). A noisy frame (each site +-60 around
+ * its level) with a dark left half and a bright right half, at 40x: the noise in flat areas
+ * (the luma's deviation from its row neighbours' mean) is at least 30% lower than with the
+ * filter off, and the edge stays as sharp: 6 output pixels either side of it, the luma is as
+ * far from the middle as without the filter. Negative control: off (luma_nr_enabled 0).
+ */
+static void luma_nr_frame(uint16_t *f, unsigned int w, unsigned int h)
+{
+	static const double level[4] = { 100, 160, 85, 19 };
+	for (unsigned int y = 0; y < h; y++)
+		for (unsigned int x = 0; x < w; x++) {
+			int ch = channel_at(x, y);
+			double k = x < w / 2 ? 0.5 : 2.5;
+			rgbir_noise = rgbir_noise * 1103515245u + 12345u;
+			double v = level[ch] * k + (double)((rgbir_noise >> 16) % 121) - 60;
+			f[(size_t)y * w + x] = (uint16_t)(BLACK_LEVEL + (v < 0 ? 0 : v > 900 ? 900 : v));
+		}
+}
+
+static int luma_nr_measure(double *noise, double *edge)
+{
+	const unsigned int w = 2592, h = 1944;
+	static unsigned char out[OUT_FRAME_BYTES];
+	uint16_t *f = malloc((size_t)w * h * sizeof(*f));
+	double saved_g = sensor_total_gain, s = 0, n = 0, lo = 0, hi = 0, ne = 0;
+
+	if (!f)
+		return -1;
+	set_rgbir_pattern();
+	sensor_total_gain = 40.0;
+	rgbir_noise = 11;
+	luma_nr_frame(f, w, h);
+	for (int k = 0; k < 3; k++) {
+		tnr_reset();
+		convert_bayer_yuyv(f, w, h, w * 2, out, sizeof(out), NULL);
+	}
+	for (int y = OUT_HEIGHT / 4; y < OUT_HEIGHT * 3 / 4; y++) {
+		const unsigned char *row = out + (size_t)y * OUT_WIDTH * 2;
+		for (int x = 8; x < OUT_WIDTH / 2 - 16; x++)	/* the flat dark half */
+			if (x > OUT_WIDTH / 8) {
+				double m = (row[(x - 2) * 2] + row[(x - 1) * 2] + row[(x + 1) * 2] + row[(x + 2) * 2]) / 4.0;
+				s += (row[x * 2] - m) * (row[x * 2] - m);
+				n++;
+			}
+		lo += row[(OUT_WIDTH / 2 - 6) * 2];
+		hi += row[(OUT_WIDTH / 2 + 6) * 2];
+		ne++;
+	}
+	sensor_total_gain = saved_g;
+	free(f);
+	*noise = sqrt(s / n);
+	*edge = (hi - lo) / ne;
+	return 0;
+}
+
+static int test_luma_nr(void)
+{
+	double noise, edge, noise_off, edge_off;
+	int result = 0;
+
+	if (load_test_locus() || luma_nr_measure(&noise, &edge))
+		return 1;
+	luma_nr_enabled = 0;
+	if (luma_nr_measure(&noise_off, &edge_off))
+		result = 2;
+	luma_nr_enabled = 1;
+	if (!result && !(noise < 0.7 * noise_off))
+		result = 3;
+	else if (!result && !(edge > 0.9 * edge_off))
+		result = 4;
+	if (luma_nr_for_gain(4) != 0 || luma_nr_for_gain(HIGH_GAIN_X) != 0 ||
+	    luma_nr_for_gain(20) <= 0 || luma_nr_for_gain(32) != luma_nr_for_gain(100))
+		result = result ? result : 5;
+	restore_colour_defaults(nir_keep_q12[2], wb_locus_nir_band);
+	return result;
 }
 
 /*
@@ -2236,6 +2326,8 @@ int main(void)
 		int r;
 		if ((r = test_white_from_brightest()))
 			return printf("test_white_from_brightest %d\n", r), 1;
+		if ((r = test_luma_nr()))
+			return printf("test_luma_nr %d\n", r), 1;
 		if ((r = test_banana_keeps_red_nir()))
 			return printf("test_banana_keeps_red_nir %d\n", r), 1;
 		if ((r = test_red_keeps_colour_nir()))

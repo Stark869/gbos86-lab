@@ -75,6 +75,7 @@ struct gpu_params {
 	int32_t detail_q12, tnr_threshold, tnr_have_previous, rotate180;
 	int32_t cfa[16], cfa_count[4];
 	int32_t crop_x, crop_y, crop_w, crop_h;
+	int32_t luma_nr;
 };
 
 enum {
@@ -596,6 +597,7 @@ static int gpu_convert(const uint16_t *raw, unsigned int width, unsigned int hei
 		p->cfa_count[c] = (int32_t)cfa_count[c];
 	p->crop_x = (int32_t)crop_x; p->crop_y = (int32_t)crop_y;
 	p->crop_w = (int32_t)crop_w; p->crop_h = (int32_t)crop_h;
+	p->luma_nr = radius > 0 ? luma_nr_for_gain(gain) : 0;
 
 	VkCommandBufferBeginInfo bi = {
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,

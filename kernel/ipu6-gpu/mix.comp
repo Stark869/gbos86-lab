@@ -4,6 +4,47 @@
 layout(local_size_x = 16, local_size_y = 16) in;
 #include "common.glsl"
 
+// luma_nr_at in kernel/ipu6-loopback.c: the same integer arithmetic.
+int grid_lum(int x, int y)
+{
+	int plane = P.col_w * P.col_h, i = y * P.col_w + x;
+	return 2126 * lin[i] + 7152 * lin[plane + i] + 722 * lin[2 * plane + i];
+}
+
+int luma_nr_at(int ox, int oy, int nr)
+{
+	int y0 = grid_lum(ox, oy);
+	int thr2 = max(nr * (max(y0, 0) >> 10), 1);
+	int wsum = 0, tsum = 0;
+	for (int dy = -2; dy <= 2; dy++)
+		for (int dx = -2; dx <= 2; dx++) {
+			int x = ox + dx, y = oy + dy;
+			if (x < 0 || x >= P.col_w || y < 0 || y >= P.col_h)
+				continue;
+			int yn = grid_lum(x, y), d = clamp((yn - y0) >> 10, -40000, 40000);
+			int d2 = d * d, w = d2 < thr2 ? 2 : d2 < 4 * thr2 ? 1 : 0;
+			wsum += w;
+			tsum += w * (yn >> 4);
+		}
+	if (wsum >= 10)
+		return (tsum / wsum) << 4;
+	int v[8];
+	int n = 0;
+	for (int dy = -1; dy <= 1; dy++)
+		for (int dx = -1; dx <= 1; dx++) {
+			int x = ox + dx, y = oy + dy;
+			if ((dx != 0 || dy != 0) && x >= 0 && x < P.col_w && y >= 0 && y < P.col_h)
+				v[n++] = grid_lum(x, y);
+		}
+	for (int i = 1; i < n; i++)
+		for (int j = i; j > 0 && v[j] < v[j - 1]; j--) {
+			int t = v[j]; v[j] = v[j - 1]; v[j - 1] = t;
+		}
+	if ((n & 1) != 0)
+		return v[n / 2];
+	return (v[n / 2 - 1] + v[n / 2]) / 2;	// luminance >= 0: the sum fits 32 bits
+}
+
 void main()
 {
 	int ox = int(gl_GlobalInvocationID.x), oy = int(gl_GlobalInvocationID.y);
@@ -18,6 +59,8 @@ void main()
 		ivec3 a = ivec3(avg[idx], avg[plane + idx], avg[2 * plane + idx]);
 		int ylin = 2126 * l.x + 7152 * l.y + 722 * l.z;	// x 10000
 		int yavg = 2126 * a.x + 7152 * a.y + 722 * a.z;
+		if (P.luma_nr > 0 && yavg > 0)
+			ylin = luma_nr_at(ox, oy, P.luma_nr);
 		if (yavg <= 0) {
 			c = l;
 		} else {
