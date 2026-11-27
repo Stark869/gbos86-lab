@@ -12,7 +12,7 @@
 #     KEYBOARD=unbind: detach atkbd from its serio port in tablet mode instead, rebind on attach (that device then
 #       disappears; whatever else the EC reports through it, e.g. hardware buttons, goes with it).
 #     KEYBOARD=0: leave the keyboard alone.
-#     EXT_KEYBOARD=desktop (default): cover off and a USB or Bluetooth keyboard plugged in = desktop mode: Android's laptop
+#     EXT_KEYBOARD=desktop (default): cover off and a USB or Bluetooth keyboard typed on = desktop mode: Android's laptop
 #       device state is requested and the on-screen keyboard setting restored; unplugging it goes back to tablet mode.
 #       EXT_KEYBOARD=0: an external keyboard changes nothing.
 # Tablet state comes from SW_TABLET_MODE (intel_hid "Intel HID switches", enable_sw_tablet_mode=2 from hwdetect.sh).
@@ -171,7 +171,9 @@ tm_keyboard_laptop() {
 
 # External keyboards: USB (bus 0003) or Bluetooth (0005) input devices with a kbd handler and the letter keys
 # (KEY_Q..KEY_P = bits 16-25, KEY_A..KEY_L = 30-38, all in the last word of "B: KEY="). That leaves out mice, consumer
-# control, power buttons, the pen and the EC's own i8042 keyboard. Prints one name per line.
+# control, power buttons, the pen and the EC's own i8042 keyboard. Prints "eventN|phys|name" per line: candidates only, a
+# wireless mouse's receiver has such a keyboard interface too (boot 27, 2026-11-27: "2.4G Receiver" 3554:fc06 kept the
+# laptop in desktop mode from the start), so see tm_typed_keyboards.
 tm_ext_keyboards() {
   awk '
     function bit(w, b,   c, v) {
@@ -186,24 +188,54 @@ tm_ext_keyboards() {
       return 1
     }
     function flush() {
-      if ((bus == "0003" || bus == "0005") && kbd && key != "" && letters(key)) print name
-      bus = ""; kbd = 0; key = ""; name = ""
+      if ((bus == "0003" || bus == "0005") && kbd && ev != "" && key != "" && letters(key)) print ev "|" phys "|" name
+      bus = ""; kbd = 0; key = ""; name = ""; ev = ""; phys = ""
     }
     /^I:/ { flush(); s = $0; sub(/.*Bus=/, "", s); bus = substr(s, 1, 4) }
     /^N: Name=/ { name = substr($0, 9) }
-    /^H: Handlers=/ { if ($0 ~ /[= ]kbd( |$)/) kbd = 1 }
+    /^P: Phys=/ { phys = substr($0, 9) }
+    /^H: Handlers=/ { if ($0 ~ /[= ]kbd( |$)/) kbd = 1; n = split($0, f, /[= ]/); for (i = 1; i <= n; i++) if (f[i] ~ /^event[0-9]+$/) ev = f[i] }
     /^B: KEY=/ { s = $0; sub(/^B: KEY=/, "", s); sub(/[ \t]+$/, "", s); m = split(s, w, " "); key = w[m] }
     END { flush() }
   ' "$TM_INPUT_DEVICES" 2>/dev/null
 }
 
-# laptop (cover attached), tablet (cover off), desktop (cover off and an external keyboard with EXT_KEYBOARD=desktop),
-# or unknown (switch not readable).
+# A candidate counts as a keyboard once it has sent an event (a key typed): one background "getevent -qc 1" per candidate
+# node; on success it leaves $TM_RUN/typed.eventN holding the candidate line, so a reused node number (another device)
+# does not match. A device that goes away ends its getevent with an error and leaves nothing.
+tm_kbd_watch_one() {
+  _wl=$1; _wev=${_wl%%|*}
+  if getevent -qc 1 "/dev/input/$_wev" > /dev/null 2>&1 && tm_ext_keyboards | grep -qxF "$_wl"; then
+    echo "$_wl" > "$TM_RUN/typed.$_wev"
+    tm_log "keyboard: typed on $_wev ${_wl##*|}: counts as an external keyboard"
+  fi
+  rm -f "$TM_RUN/watch.$_wev"
+}
+tm_kbd_watch() {
+  [ "$TM_EXT_KEYBOARD" = desktop ] || return 0
+  tm_ext_keyboards | while IFS= read -r _l; do
+    _e=${_l%%|*}
+    [ "$(cat "$TM_RUN/typed.$_e" 2>/dev/null)" = "$_l" ] && continue
+    [ "$(cat "$TM_RUN/watch.$_e" 2>/dev/null)" = "$_l" ] && continue
+    echo "$_l" > "$TM_RUN/watch.$_e"
+    tm_kbd_watch_one "$_l" &
+  done
+}
+# Names of the candidates that were typed on and are still plugged in.
+tm_typed_keyboards() {
+  tm_ext_keyboards | while IFS= read -r _l; do
+    [ "$(cat "$TM_RUN/typed.${_l%%|*}" 2>/dev/null)" = "$_l" ] && echo "${_l##*|}"
+  done
+}
+tm_names() { tr '\n' ',' | sed 's/,$//'; }
+
+# laptop (cover attached), tablet (cover off), desktop (cover off and an external keyboard typed on, with
+# EXT_KEYBOARD=desktop), or unknown (switch not readable).
 tm_mode() {
   _sw=$(tm_tablet_state "$TM_DEV")
   case "$_sw" in
     0) echo laptop ;;
-    1) if [ "$TM_EXT_KEYBOARD" = desktop ] && [ -n "$(tm_ext_keyboards)" ]; then echo desktop; else echo tablet; fi ;;
+    1) if [ "$TM_EXT_KEYBOARD" = desktop ] && [ -n "$(tm_typed_keyboards)" ]; then echo desktop; else echo tablet; fi ;;
     *) echo unknown ;;
   esac
 }
@@ -237,7 +269,7 @@ tm_apply_mode() {
   _last=$(cat "$TM_RUN/mode" 2>/dev/null) || _last=
   [ "$_st" = "$_last" ] && return 1
   echo "$_st" > "$TM_RUN/mode"
-  _kb=$(tm_ext_keyboards | tr '\n' ',' | sed 's/,$//')
+  _kb=$(tm_typed_keyboards | tm_names)
   tm_log "switch: mode $_st (was ${_last:-unset}, $1); SW_TABLET_MODE=$(tm_tablet_state "$TM_DEV"); external keyboards: ${_kb:-none}; device_state: $(tm_device_state)"
   case "$_st" in
     laptop) tm_override_off; tm_keyboard_laptop laptop ;;
@@ -278,7 +310,7 @@ tm_report() {
   echo "== dumpsys device_state"; timeout 10 dumpsys device_state 2>&1 | head -n 60
   echo "== settings"
   for _u in $(tm_users); do echo "user $_u show_ime_with_hard_keyboard=$(tm_ime_get "$_u")"; done
-  echo "external keyboards: $(tm_ext_keyboards | tr '\n' ',' | sed 's/,$//')"
+  echo "keyboard candidates (count once typed on): $(tm_ext_keyboards | tm_names)"
   echo "fixed-to-user-rotation=$(echo $(cmd window fixed-to-user-rotation 2>&1)) user-rotation=$(echo $(cmd window user-rotation 2>&1))"
   echo "config.override_forced_orient=$(getprop config.override_forced_orient)"
   echo "== events"
@@ -311,11 +343,11 @@ tm_main() {
   while true; do
     if [ "$_i" -lt "$TM_FAST_POLLS" ]; then
       sleep 2; _i=$((_i + 1))
-      [ -n "$TM_DEV" ] && tm_apply_mode "poll"
+      [ -n "$TM_DEV" ] && { tm_kbd_watch; tm_apply_mode "poll"; }
       tm_rotation_check "poll"
     else
       sleep "$TM_MODE_POLL"; _t=$((_t + TM_MODE_POLL))
-      [ -n "$TM_DEV" ] && tm_apply_mode "poll"
+      [ -n "$TM_DEV" ] && { tm_kbd_watch; tm_apply_mode "poll"; }
       if [ "$_t" -ge "$TM_POLL" ]; then
         _t=0
         [ -n "$TM_DEV" ] && tm_keep_mode

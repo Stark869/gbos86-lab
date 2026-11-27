@@ -53,7 +53,10 @@ diff -u "$T/expected" "$T/switches"
 # boot); GETEVENT_PREFIX=1 also checks a "<device>: <bits>" form.
 GETEVENT_BITS=0002
 GETEVENT_PREFIX=0
+GETEVENT_TYPED=
 getevent() {
+  # -qc 1 NODE: a key typed on NODE (listed in GETEVENT_TYPED) or the device went away (error).
+  if [ "$1 $2" = "-qc 1" ]; then case " $GETEVENT_TYPED " in *" $3 "*) echo "0001 001e 00000001"; return 0 ;; *) return 1 ;; esac; fi
   [ "$1" = -qS ] || return 1
   [ -n "$GETEVENT_BITS" ] || return 0
   if [ "$GETEVENT_PREFIX" = 1 ]; then printf '%s: %s\n' "$2" "$GETEVENT_BITS"; else printf '%s\n' "$GETEVENT_BITS"; fi
@@ -180,7 +183,7 @@ H: Handlers=kbd event25
 B: KEY=1c03 0 0 0 0 0
 EOF
 TM_INPUT_DEVICES=$T/devices-ext
-[ "$(tm_ext_keyboards)" = '"HP USB Keyboard Consumer Control"' ] || fail "consumer control with letters: $(tm_ext_keyboards)"
+[ "$(tm_ext_keyboards)" = 'event24||"HP USB Keyboard Consumer Control"' ] || fail "consumer control with letters: $(tm_ext_keyboards)"
 # A real consumer-control device has no letter keys.
 sed -i 's/^B: KEY=3f000303ff 0 0 483ffff17aff32d.*/B: KEY=1 0 0 0 0 0 0 0 7c000000000/' "$T/devices-ext"
 cat >> "$T/devices-ext" <<'EOF2'
@@ -204,18 +207,30 @@ N: Name="BT Keyboard"
 H: Handlers=sysrq kbd leds event26
 B: KEY=1000000000007 ff9f207ac14057ff febeffdfffefffff fffffffffffffffe
 EOF
-[ "$(tm_ext_keyboards | tr '\n' ,)" = '"HP USB Keyboard","BT Keyboard",' ] || fail "external keyboards not found: $(tm_ext_keyboards)"
+[ "$(tm_ext_keyboards | tr '\n' ,)" = 'event23||"HP USB Keyboard",event26||"BT Keyboard",' ] || fail "external keyboards not found: $(tm_ext_keyboards)"
 
 USERS='0 10'; echo 0 > "$T/ime.0"; echo 0 > "$T/ime.10"; rm -f "$T/run/mode" "$T/ds.log"; echo 3 > "$T/ds"; : > "$T/tablet-mode.txt"
 TM_INPUT_DEVICES=$T/devices
 GETEVENT_BITS=0002; tm_apply_mode detach
 [ "$(cat "$T/run/mode")" = tablet ] && [ "$(cat "$T/ime.10")" = 1 ] || fail "no tablet mode before the keyboard"
 TM_INPUT_DEVICES=$T/devices-ext
+# Plugged in but nothing typed (a mouse receiver's keyboard interface looks the same): still tablet.
+GETEVENT_TYPED=; tm_kbd_watch; wait
+if tm_apply_mode "keyboard in"; then fail "desktop without a key typed"; fi
+[ "$(cat "$T/run/mode")" = tablet ] && [ ! -e "$T/ds.log" ] || fail "an untyped keyboard changed the mode"
+[ -z "$(ls "$T/run" | grep -E '^(watch|typed)\.')" ] || fail "watch/typed records left without a key: $(ls "$T/run")"
+# A key typed on the HP keyboard: desktop (the BT keyboard, never typed on, is not listed).
+GETEVENT_TYPED=/dev/input/event23; tm_kbd_watch; wait
+[ "$(cat "$T/run/typed.event23")" = 'event23||"HP USB Keyboard"' ] && [ ! -e "$T/run/typed.event26" ] || fail "typed record wrong: $(ls "$T/run")"
+grep -q 'keyboard: typed on event23 "HP USB Keyboard"' "$T/tablet-mode.txt" || fail "typing not logged"
 tm_apply_mode "keyboard in" || fail "keyboard plug-in not applied"
 [ "$(cat "$T/run/mode")" = desktop ] || fail "not desktop with an external keyboard"
+# Watching again does not start a second getevent for a typed keyboard.
+GETEVENT_TYPED=; tm_kbd_watch; wait
+[ -e "$T/run/typed.event23" ] || fail "typed record dropped by a later watch"
 [ "$(cat "$T/ds.log")" = 2 ] && [ -e "$T/run/override" ] || fail "desktop state not requested: $(cat "$T/ds.log" 2>/dev/null)"
 [ "$(cat "$T/ime.0")" = 0 ] && [ "$(cat "$T/ime.10")" = 0 ] || fail "on-screen keyboard setting not restored in desktop mode"
-grep -q 'mode desktop (was tablet, keyboard in); SW_TABLET_MODE=1; external keyboards: "HP USB Keyboard","BT Keyboard"' "$T/tablet-mode.txt" ||
+grep -q 'mode desktop (was tablet, keyboard in); SW_TABLET_MODE=1; external keyboards: "HP USB Keyboard"; ' "$T/tablet-mode.txt" ||
   fail "desktop not logged: $(cat "$T/tablet-mode.txt")"
 grep -q 'desktop: requested device state 2' "$T/tablet-mode.txt" || fail "request not logged"
 # Android dropped the request: the slow poll asks again; while it holds, nothing happens.
@@ -228,6 +243,10 @@ TM_INPUT_DEVICES=$T/devices
 tm_apply_mode "keyboard out" || fail "unplug not applied"
 [ "$(cat "$T/run/mode")" = tablet ] && [ "$(tail -n 1 "$T/ds.log")" = reset ] && [ ! -e "$T/run/override" ] || fail "unplug did not reset the device state"
 [ "$(cat "$T/ime.10")" = 1 ] || fail "on-screen keyboard not back after unplug"
+# Another device on the same node number is not "typed".
+sed 's/^N: Name="HP USB Keyboard"$/N: Name="Other Keyboard"/' "$T/devices-ext" > "$T/devices-other"
+TM_INPUT_DEVICES=$T/devices-other
+[ -z "$(tm_typed_keyboards)" ] || fail "typed record matched another device: $(tm_typed_keyboards)"
 # Cover attached with the keyboard in: laptop, request reset.
 TM_INPUT_DEVICES=$T/devices-ext; tm_apply_mode "keyboard in"; GETEVENT_BITS=0000; tm_apply_mode attach
 [ "$(cat "$T/run/mode")" = laptop ] && [ "$(tail -n 1 "$T/ds.log")" = reset ] && [ "$(cat "$T/ime.10")" = 0 ] || fail "attach from desktop wrong"
