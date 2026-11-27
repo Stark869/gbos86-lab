@@ -1019,6 +1019,12 @@ cmd_install_app() {
   cmd deviceidle whitelist +"$SU_PKG" >> "$_log" 2>&1 || echo "deviceidle whitelist +$SU_PKG failed" >> "$_log"
   # The Settings entry (hook.sh gbos_settings_updater_entry): is the static overlay of Settings known and enabled? ([x] = enabled)
   { echo "overlays of com.android.settings:"; cmd overlay list com.android.settings 2>&1 | head -n 20; } >> "$_log" 2>&1
+  # Per user (the desktop user is 10, started after this runs): the overlay and the value Settings' System page reads.
+  for _u in $(pm list users 2>/dev/null | sed -n 's/.*UserInfo{\([0-9][0-9]*\):.*/\1/p'); do
+    { echo "user $_u: $(cmd overlay list --user "$_u" com.android.settings 2>&1 | grep gbos86 | tr '\n' ' ')" \
+        "config_additional_system_update_setting_enable=$(cmd overlay lookup --user "$_u" com.android.settings com.android.settings:bool/config_additional_system_update_setting_enable 2>&1 | tr '\n' ' ')"
+    } >> "$_log" 2>&1
+  done
   # the app's update check at startup (its own BOOT_COMPLETED receiver does not run until the app was opened once). The app decides
   # (Settings: "Check when the laptop starts") and waits for the network itself.
   am broadcast -a org.gbos86.updater.BOOT_CHECK -n "$SU_PKG/.BootReceiver" -f 0x20 >> "$_log" 2>&1

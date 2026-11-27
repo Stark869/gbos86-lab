@@ -98,36 +98,144 @@ tm_rotation_check poll
 [ "$(cat "$T/rotation")" = default ] || fail "rotation changed with ROTATION=0"
 TM_ROTATION=1
 
-# Keyboard (ime): saved on detach, restored on attach; only on a state change.
+# Keyboard (ime): saved on detach, restored on attach; only on a mode change; every user (user 10 = the desktop user,
+# started after the helper's first run on hardware).
+USERS='0'
+pm() { [ "$1 $2" = "list users" ] || return 1; echo Users:; for _x in $USERS; do printf '\tUserInfo{%s:User%s:c13} running\n' "$_x" "$_x"; done; }
 settings() {
-  [ "$1 $2" = "--user current" ] || { echo "settings without --user current: $*" >> "$T/errors"; return 1; }
-  shift 2
+  [ "$1" = --user ] || { echo "settings without --user: $*" >> "$T/errors"; return 1; }
+  case "$2" in ''|*[!0-9]*) [ "$2" = current ] || { echo "bad user: $*" >> "$T/errors"; return 1; } ;; esac
+  _su=$2; shift 2
   case "$1" in
-    get) cat "$T/ime" 2>/dev/null || echo null ;;
-    put) echo "$4" > "$T/ime" ;;
-    delete) rm -f "$T/ime"; echo "Deleted 1 rows" ;;
+    get) cat "$T/ime.$_su" 2>/dev/null || echo null ;;
+    put) echo "$4" > "$T/ime.$_su" ;;
+    delete) rm -f "$T/ime.$_su"; echo "Deleted 1 rows" ;;
   esac
 }
-echo 0 > "$T/ime"
+# Device state: cmd device_state state N|reset; dumpsys shows the committed state (3 = TABLET, the switch's base state).
+echo 3 > "$T/ds"
+cmd() {
+  case "$1 $2" in
+    "device_state state")
+      echo "$3" >> "$T/ds.log"
+      if [ "$3" = reset ]; then echo 3 > "$T/ds"; else echo "$3" > "$T/ds"; fi ;;
+    "window fixed-to-user-rotation") echo disabled ;;
+    "window user-rotation") echo lock 0 ;;
+  esac
+  return 0
+}
+dumpsys() { echo "  mCommittedState=Optional[DeviceState{identifier=$(cat "$T/ds"), name='X'}]"; }
+TM_EXT_KEYBOARD=desktop
+echo 0 > "$T/ime.0"
 TM_DEV=/dev/input/event21
 GETEVENT_BITS=0002
 tm_apply_mode test || fail "detach not applied"
-[ "$(cat "$T/ime")" = 1 ] && [ "$(cat "$T/state/ime_saved")" = 0 ] || fail "tablet did not enable show_ime_with_hard_keyboard"
-grep -q 'SW_TABLET_MODE=1 (was unset, test).*TABLET' "$T/tablet-mode.txt" || fail "switch change not logged"
+[ "$(cat "$T/ime.0")" = 1 ] && [ "$(cat "$T/state/ime_saved.0")" = 0 ] || fail "tablet did not enable show_ime_with_hard_keyboard"
+grep -q 'mode tablet (was unset, test); SW_TABLET_MODE=1; external keyboards: none' "$T/tablet-mode.txt" || fail "mode change not logged: $(cat "$T/tablet-mode.txt")"
 if tm_apply_mode again; then fail "unchanged state applied twice"; fi
+# The desktop user starts later: the slow poll gives it the setting too, and leaves user 0 alone.
+USERS='0 10'; echo 0 > "$T/ime.10"; : > "$T/tablet-mode.txt"
+tm_keep_mode
+[ "$(cat "$T/ime.10")" = 1 ] && [ "$(cat "$T/state/ime_saved.10")" = 0 ] || fail "user 10 did not get show_ime_with_hard_keyboard"
+grep -q 'user 10 show_ime_with_hard_keyboard=1' "$T/tablet-mode.txt" && ! grep -q 'user 0 ' "$T/tablet-mode.txt" || fail "keep_mode log wrong: $(cat "$T/tablet-mode.txt")"
+: > "$T/tablet-mode.txt"; tm_keep_mode
+[ ! -s "$T/tablet-mode.txt" ] || fail "keep_mode logged without a change"
+[ ! -e "$T/ds.log" ] || fail "device state touched in tablet mode"
 GETEVENT_BITS=0000
 tm_apply_mode attach || fail "attach not applied"
-[ "$(cat "$T/ime")" = 0 ] && [ ! -e "$T/state/ime_saved" ] || fail "laptop did not restore show_ime_with_hard_keyboard"
+[ "$(cat "$T/ime.0")" = 0 ] && [ "$(cat "$T/ime.10")" = 0 ] && [ -z "$(ls "$T/state" | grep ime_saved)" ] ||
+  fail "laptop did not restore show_ime_with_hard_keyboard for both users"
+[ ! -e "$T/ds.log" ] || fail "device state reset without a request of ours"
 # The setting was never set (null): restore by deleting it.
-rm -f "$T/ime" "$T/run/mode"
+USERS=0; rm -f "$T/ime.0" "$T/ime.10" "$T/run/mode"
 GETEVENT_BITS=0002; tm_apply_mode detach
-[ "$(cat "$T/state/ime_saved")" = null ] || fail "null setting not saved"
+[ "$(cat "$T/state/ime_saved.0")" = null ] || fail "null setting not saved"
 GETEVENT_BITS=0000; tm_apply_mode attach
-[ ! -e "$T/ime" ] || fail "null setting not deleted on attach"
-# A reboot in tablet mode: the next start in laptop state restores the saved value.
-echo 1 > "$T/ime"; echo 0 > "$T/state/ime_saved"; rm -f "$T/run/mode"
+[ ! -e "$T/ime.0" ] || fail "null setting not deleted on attach"
+# A reboot in tablet mode: the next start in laptop state restores the saved value (also the old single-file record).
+echo 1 > "$T/ime.0"; echo 0 > "$T/state/ime_saved"; rm -f "$T/run/mode"
 tm_apply_mode start
-[ "$(cat "$T/ime")" = 0 ] || fail "stale tablet setting not restored at start"
+[ "$(cat "$T/ime.0")" = 0 ] && [ ! -e "$T/state/ime_saved" ] || fail "stale tablet setting not restored at start"
+
+# External keyboard -> desktop mode. USB keyboard and a Bluetooth one count; a USB mouse, a consumer-control device
+# (kbd handler, no letters) and the pen do not; the EC's i8042 keyboard does not.
+cp "$T/devices" "$T/devices-ext"
+cat >> "$T/devices-ext" <<'EOF'
+
+I: Bus=0003 Vendor=046d Product=c077 Version=0111
+N: Name="USB Optical Mouse"
+H: Handlers=mouse0 event22
+B: EV=17
+B: KEY=70000 0 0 0 0
+
+I: Bus=0003 Vendor=03f0 Product=0024 Version=0110
+N: Name="HP USB Keyboard Consumer Control"
+H: Handlers=kbd event24
+B: EV=1f
+B: KEY=3f000303ff 0 0 483ffff17aff32d bfd4444600000000 1 130ff38b17c007 ffe77bfad9415fff febeffdfffefffff fffffffffffffffe
+
+I: Bus=0018 Vendor=2d1f Product=49a5 Version=0100
+N: Name="Wacom HID 49A5 Pen"
+H: Handlers=kbd event25
+B: KEY=1c03 0 0 0 0 0
+EOF
+TM_INPUT_DEVICES=$T/devices-ext
+[ "$(tm_ext_keyboards)" = '"HP USB Keyboard Consumer Control"' ] || fail "consumer control with letters: $(tm_ext_keyboards)"
+# A real consumer-control device has no letter keys.
+sed -i 's/^B: KEY=3f000303ff 0 0 483ffff17aff32d.*/B: KEY=1 0 0 0 0 0 0 0 7c000000000/' "$T/devices-ext"
+cat >> "$T/devices-ext" <<'EOF2'
+
+I: Bus=0003 Vendor=1234 Product=0001 Version=0100
+N: Name="Half Keypad"
+H: Handlers=kbd event27
+B: KEY=43ff0000
+EOF2
+[ -z "$(tm_ext_keyboards)" ] || fail "consumer control / mouse / pen counted as a keyboard: $(tm_ext_keyboards)"
+cat >> "$T/devices-ext" <<'EOF'
+
+I: Bus=0003 Vendor=03f0 Product=0024 Version=0110
+N: Name="HP USB Keyboard"
+H: Handlers=sysrq kbd leds event23
+B: EV=120013
+B: KEY=1000000000007 ff9f207ac14057ff febeffdfffefffff fffffffffffffffe
+
+I: Bus=0005 Vendor=05ac Product=0255 Version=0050
+N: Name="BT Keyboard"
+H: Handlers=sysrq kbd leds event26
+B: KEY=1000000000007 ff9f207ac14057ff febeffdfffefffff fffffffffffffffe
+EOF
+[ "$(tm_ext_keyboards | tr '\n' ,)" = '"HP USB Keyboard","BT Keyboard",' ] || fail "external keyboards not found: $(tm_ext_keyboards)"
+
+USERS='0 10'; echo 0 > "$T/ime.0"; echo 0 > "$T/ime.10"; rm -f "$T/run/mode" "$T/ds.log"; echo 3 > "$T/ds"; : > "$T/tablet-mode.txt"
+TM_INPUT_DEVICES=$T/devices
+GETEVENT_BITS=0002; tm_apply_mode detach
+[ "$(cat "$T/run/mode")" = tablet ] && [ "$(cat "$T/ime.10")" = 1 ] || fail "no tablet mode before the keyboard"
+TM_INPUT_DEVICES=$T/devices-ext
+tm_apply_mode "keyboard in" || fail "keyboard plug-in not applied"
+[ "$(cat "$T/run/mode")" = desktop ] || fail "not desktop with an external keyboard"
+[ "$(cat "$T/ds.log")" = 2 ] && [ -e "$T/run/override" ] || fail "desktop state not requested: $(cat "$T/ds.log" 2>/dev/null)"
+[ "$(cat "$T/ime.0")" = 0 ] && [ "$(cat "$T/ime.10")" = 0 ] || fail "on-screen keyboard setting not restored in desktop mode"
+grep -q 'mode desktop (was tablet, keyboard in); SW_TABLET_MODE=1; external keyboards: "HP USB Keyboard","BT Keyboard"' "$T/tablet-mode.txt" ||
+  fail "desktop not logged: $(cat "$T/tablet-mode.txt")"
+grep -q 'desktop: requested device state 2' "$T/tablet-mode.txt" || fail "request not logged"
+# Android dropped the request: the slow poll asks again; while it holds, nothing happens.
+echo 3 > "$T/ds"; tm_keep_mode
+[ "$(tr '\n' ' ' < "$T/ds.log")" = '2 2 ' ] || fail "lost request not renewed: $(cat "$T/ds.log")"
+tm_keep_mode
+[ "$(tr '\n' ' ' < "$T/ds.log")" = '2 2 ' ] || fail "request renewed while it held"
+# Unplugged: back to tablet, request reset, on-screen keyboard again.
+TM_INPUT_DEVICES=$T/devices
+tm_apply_mode "keyboard out" || fail "unplug not applied"
+[ "$(cat "$T/run/mode")" = tablet ] && [ "$(tail -n 1 "$T/ds.log")" = reset ] && [ ! -e "$T/run/override" ] || fail "unplug did not reset the device state"
+[ "$(cat "$T/ime.10")" = 1 ] || fail "on-screen keyboard not back after unplug"
+# Cover attached with the keyboard in: laptop, request reset.
+TM_INPUT_DEVICES=$T/devices-ext; tm_apply_mode "keyboard in"; GETEVENT_BITS=0000; tm_apply_mode attach
+[ "$(cat "$T/run/mode")" = laptop ] && [ "$(tail -n 1 "$T/ds.log")" = reset ] && [ "$(cat "$T/ime.10")" = 0 ] || fail "attach from desktop wrong"
+# EXT_KEYBOARD=0: the keyboard changes nothing.
+TM_EXT_KEYBOARD=0; rm -f "$T/run/mode"; GETEVENT_BITS=0002; tm_apply_mode detach
+[ "$(cat "$T/run/mode")" = tablet ] || fail "EXT_KEYBOARD=0 still went to desktop"
+GETEVENT_BITS=0000; tm_apply_mode attach; TM_EXT_KEYBOARD=desktop
+TM_INPUT_DEVICES=$T/devices
 [ ! -e "$T/errors" ] || fail "$(cat "$T/errors")"
 
 # Keyboard (unbind): atkbd detached with "none" (no newline: serio uses strncmp with the write length), rebound on attach.
@@ -147,7 +255,7 @@ GETEVENT_BITS=0000; tm_apply_mode attach
 [ "$(cat "$T/sys/bus/serio/devices/serio0/bind_mode")" = auto ] || fail "bind_mode not restored"
 [ ! -e "$T/state/atkbd_ports" ] || fail "port record not cleared"
 TM_KEYBOARD=ime
-unset -f getevent cmd dumpsys settings timeout
+unset -f getevent cmd dumpsys settings timeout pm
 
 # ---- usb/hwdetect.sh ------------------------------------------------------------------------------------------------
 log() { printf '%s\n' "$*" >> "$T/hwlog"; }
@@ -203,17 +311,22 @@ GBOS_SENSOR_ROTATION_POLICY_SELECTED=1
 gbos_tablet_mode_config
 [ "$GBOS_TABLET_MODE_START" = '    start gbos_tablet_mode' ] || fail "helper not started"
 case "$GBOS_TABLET_MODE_SERVICE" in
-  'service gbos_tablet_mode /system/bin/sh /postinstall/gbos/tablet_mode.sh /postinstall/gbos/logs/boot-7/tablet-mode.txt 1 ime'*'seclabel u:r:shell:s0'*oneshot*disabled) ;;
+  'service gbos_tablet_mode /system/bin/sh /postinstall/gbos/tablet_mode.sh /postinstall/gbos/logs/boot-7/tablet-mode.txt 1 ime desktop'*'seclabel u:r:shell:s0'*oneshot*disabled) ;;
   *) fail "unexpected service: $GBOS_TABLET_MODE_SERVICE" ;;
 esac
 [ -z "$GBOS_ROTATION_OVERRIDE_PROP" ] || fail "override prop set by default"
 ROTATION_OVERRIDE=1 TABLET_KEYBOARD=unbind
 gbos_tablet_mode_config
 [ "$GBOS_ROTATION_OVERRIDE_PROP" = '    setprop config.override_forced_orient true' ] || fail "ROTATION_OVERRIDE=1 ignored"
-case "$GBOS_TABLET_MODE_SERVICE" in *'tablet-mode.txt 1 unbind'*) ;; *) fail "TABLET_KEYBOARD=unbind ignored" ;; esac
+case "$GBOS_TABLET_MODE_SERVICE" in *'tablet-mode.txt 1 unbind desktop'*) ;; *) fail "TABLET_KEYBOARD=unbind ignored" ;; esac
+TABLET_EXT_KEYBOARD=0; gbos_tablet_mode_config
+case "$GBOS_TABLET_MODE_SERVICE" in *'tablet-mode.txt 1 unbind 0'*) ;; *) fail "TABLET_EXT_KEYBOARD=0 ignored" ;; esac
+TABLET_EXT_KEYBOARD=bogus; gbos_tablet_mode_config
+case "$GBOS_TABLET_MODE_SERVICE" in *'tablet-mode.txt 1 unbind desktop'*) ;; *) fail "unknown TABLET_EXT_KEYBOARD not defaulted" ;; esac
+unset TABLET_EXT_KEYBOARD
 GBOS_SENSOR_ROTATION_POLICY_SELECTED=0
 gbos_tablet_mode_config
-case "$GBOS_TABLET_MODE_SERVICE" in *'tablet-mode.txt 0 unbind'*) ;; *) fail "rotation enforced without the rotation trial" ;; esac
+case "$GBOS_TABLET_MODE_SERVICE" in *'tablet-mode.txt 0 unbind desktop'*) ;; *) fail "rotation enforced without the rotation trial" ;; esac
 [ -z "$GBOS_ROTATION_OVERRIDE_PROP" ] || fail "override prop set without the rotation trial"
 unset ROTATION_OVERRIDE TABLET_KEYBOARD
 TABLET_MODE=0

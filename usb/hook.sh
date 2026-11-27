@@ -21,7 +21,7 @@ if [ ! -c /dev/null ]; then
 fi
 
 # Updater lab test (branch lab/updater-test only, never on main): the published test update changes this number
-log "hook: gbOS86 lab marker 22"
+log "hook: gbOS86 lab marker 23"
 
 # Reset one-shot MODE=live back to MODE=ask so subsequent boots prompt the user
 if [ -f "$G/gbos.cfg" ] && grep -q '^MODE=live' "$G/gbos.cfg" 2>/dev/null; then
@@ -634,7 +634,8 @@ done
 [ -f $G/crossystem ] && mount --bind $G/crossystem /new/vendor/bin/crossystem && log "hook: crossystem faked"
 
 # Latitude 7320 Detachable tablet mode (usb/tablet_mode.sh, log logs/boot-N/tablet-mode.txt): on-screen keyboard when the
-# cover is detached (TABLET_KEYBOARD=ime|unbind|0) and, with the rotation trial selected, keeps
+# cover is detached (TABLET_KEYBOARD=ime|unbind|0), desktop mode while the cover is off and a USB/Bluetooth keyboard is
+# plugged in (TABLET_EXT_KEYBOARD=desktop|0) and, with the rotation trial selected, keeps
 # fixed-to-user-rotation disabled through Google's LaptopController resets. TABLET_MODE=0 turns the helper off.
 # ROTATION_OVERRIDE=1 additionally sets config.override_forced_orient (read only by DisplayRotation.configure in
 # services.jar: "default" then stops meaning fixed on a PC, for every display, external monitors included).
@@ -659,13 +660,17 @@ gbos_tablet_mode_config() {
     ime|unbind|0) _tm_kbd=${TABLET_KEYBOARD:-ime} ;;
     *) log "hook: TABLET_KEYBOARD=$TABLET_KEYBOARD unknown, using ime"; _tm_kbd=ime ;;
   esac
+  case "${TABLET_EXT_KEYBOARD:-desktop}" in
+    desktop|0) _tm_ext=${TABLET_EXT_KEYBOARD:-desktop} ;;
+    *) log "hook: TABLET_EXT_KEYBOARD=$TABLET_EXT_KEYBOARD unknown, using desktop"; _tm_ext=desktop ;;
+  esac
   _tm_rot=0
   [ "${GBOS_SENSOR_ROTATION_POLICY_SELECTED:-0}" = 1 ] && _tm_rot=1
   if [ "$_tm_rot" = 1 ] && [ "${ROTATION_OVERRIDE:-0}" = 1 ]; then
     GBOS_ROTATION_OVERRIDE_PROP="    setprop config.override_forced_orient true"
   fi
   GBOS_TABLET_MODE_START="    start gbos_tablet_mode"
-  GBOS_TABLET_MODE_SERVICE="service gbos_tablet_mode /system/bin/sh /postinstall/gbos/tablet_mode.sh /postinstall/gbos/logs/boot-$N/tablet-mode.txt $_tm_rot $_tm_kbd
+  GBOS_TABLET_MODE_SERVICE="service gbos_tablet_mode /system/bin/sh /postinstall/gbos/tablet_mode.sh /postinstall/gbos/logs/boot-$N/tablet-mode.txt $_tm_rot $_tm_kbd $_tm_ext
     user root
     group root input
     seclabel u:r:shell:s0
