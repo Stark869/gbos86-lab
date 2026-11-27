@@ -203,18 +203,22 @@ tm_ext_keyboards() {
 # A candidate counts as a keyboard once it has sent an event (a key typed): one background "getevent -qc 1" per candidate
 # node; on success it leaves $TM_RUN/typed.eventN holding the candidate line, so a reused node number (another device)
 # does not match. A device that goes away ends its getevent with an error and leaves nothing.
+# The fields are split with cut/sed, never with a %%-pattern on the pipe sign: Android's mksh reads "|" in a pattern as "or", so that gave an
+# empty node and no watcher ever matched (boot 28, 2026-11-27: /dev/gbos-tablet/watch. in the avc lines).
+tm_kbd_ev() { printf '%s\n' "$1" | cut -d'|' -f1; }
+tm_kbd_name() { printf '%s\n' "$1" | sed 's/^[^|]*|[^|]*|//'; }
 tm_kbd_watch_one() {
-  _wl=$1; _wev=${_wl%%|*}
+  _wl=$1; _wev=$(tm_kbd_ev "$_wl")
   if getevent -qc 1 "/dev/input/$_wev" > /dev/null 2>&1 && tm_ext_keyboards | grep -qxF "$_wl"; then
     echo "$_wl" > "$TM_RUN/typed.$_wev"
-    tm_log "keyboard: typed on $_wev ${_wl##*|}: counts as an external keyboard"
+    tm_log "keyboard: typed on $_wev $(tm_kbd_name "$_wl"): counts as an external keyboard"
   fi
   rm -f "$TM_RUN/watch.$_wev"
 }
 tm_kbd_watch() {
   [ "$TM_EXT_KEYBOARD" = desktop ] || return 0
   tm_ext_keyboards | while IFS= read -r _l; do
-    _e=${_l%%|*}
+    _e=$(tm_kbd_ev "$_l"); [ -n "$_e" ] || continue
     [ "$(cat "$TM_RUN/typed.$_e" 2>/dev/null)" = "$_l" ] && continue
     [ "$(cat "$TM_RUN/watch.$_e" 2>/dev/null)" = "$_l" ] && continue
     echo "$_l" > "$TM_RUN/watch.$_e"
@@ -224,7 +228,7 @@ tm_kbd_watch() {
 # Names of the candidates that were typed on and are still plugged in.
 tm_typed_keyboards() {
   tm_ext_keyboards | while IFS= read -r _l; do
-    [ "$(cat "$TM_RUN/typed.${_l%%|*}" 2>/dev/null)" = "$_l" ] && echo "${_l##*|}"
+    [ "$(cat "$TM_RUN/typed.$(tm_kbd_ev "$_l")" 2>/dev/null)" = "$_l" ] && tm_kbd_name "$_l"
   done
 }
 tm_names() { tr '\n' ',' | sed 's/,$//'; }

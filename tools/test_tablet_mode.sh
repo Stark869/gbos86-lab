@@ -364,5 +364,7 @@ for f in usb/install.sh tools/deploy_stick.sh tools/make_gbos86_image.sh; do
   grep -q 'tablet_mode\.sh' "$ROOT/$f" || fail "$f does not ship tablet_mode.sh"
 done
 sh -n "$ROOT/usb/tablet_mode.sh"
+# Android's /system/bin/sh is mksh, which reads "|" inside a ${var%pattern} as alternation (boot 28): none of those here.
+! grep -nE '\$\{[A-Za-z_][A-Za-z0-9_]*(%%?|##?)[^}]*\|' "$ROOT/usb/tablet_mode.sh" || fail "a | inside a \${...} pattern (mksh alternation)"
 
 echo "tablet mode tests passed"
