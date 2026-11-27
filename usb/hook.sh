@@ -21,7 +21,7 @@ if [ ! -c /dev/null ]; then
 fi
 
 # Updater lab test (branch lab/updater-test only, never on main): the published test update changes this number
-log "hook: gbOS86 lab marker 26"
+log "hook: gbOS86 lab marker 27"
 
 # Reset one-shot MODE=live back to MODE=ask so subsequent boots prompt the user
 if [ -f "$G/gbos.cfg" ] && grep -q '^MODE=live' "$G/gbos.cfg" 2>/dev/null; then
@@ -339,6 +339,37 @@ gbos_settings_updater_entry() {
   log "hook: Settings updater entry added (Settings > System > Software update > gbOS86 updates; $_su_apk in /vendor/overlay)"
 }
 gbos_settings_updater_entry
+
+# Input devices Android should never open (gbos.cfg IGNORE_INPUT_DEVICES="name, name", exact names from
+# /proc/bus/input/devices). A wireless mouse's receiver often has a full keyboard interface ("2.4G Receiver" 3554:fc06
+# on the Latitude 7320 owner's mouse): Gboard then stays in its physical-keyboard mode and shows no on-screen keyboard,
+# whatever show_ime_with_hard_keyboard says (boots 28 and 32, 2026-11-27). Google's /vendor/etc/excluded-input-devices.xml
+# (InputManagerService reads it at start; Google lists "Power Button") gets a copy with the names added, bind-mounted
+# from /dev (initramfs /tmp is gone after switch_root).
+gbos_ignore_input_devices() {
+  [ -n "${IGNORE_INPUT_DEVICES:-}" ] || return 0
+  _ii_dst=${NEWROOT:-/new}/vendor/etc/excluded-input-devices.xml
+  _ii_dir=${GBOS_INPUT_IGNORE_DIR:-/dev/.gbos-input}
+  if [ ! -f "$_ii_dst" ] || ! grep -q '</devices>' "$_ii_dst"; then
+    log "hook: IGNORE_INPUT_DEVICES NOT applied (no $_ii_dst with <devices>)"; return 0
+  fi
+  mkdir -p "$_ii_dir" || { log "hook: IGNORE_INPUT_DEVICES NOT applied (cannot create $_ii_dir)"; return 0; }
+  _ii_new=$_ii_dir/excluded-input-devices.xml
+  _ii_list=
+  printf '%s\n' "$IGNORE_INPUT_DEVICES" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' > "$_ii_dir/names"
+  while IFS= read -r _ii_n; do
+    _ii_list="$_ii_list${_ii_list:+, }\"$(printf '%s' "$_ii_n" | sed 's/"/\\"/g')\""
+  done < "$_ii_dir/names"
+  sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g; s/.*/    <device name="&"\/>/' "$_ii_dir/names" > "$_ii_dir/entries"
+  awk -v f="$_ii_dir/entries" '/<\/devices>/ && !done { while ((getline l < f) > 0) print l; done = 1 } { print }' "$_ii_dst" > "$_ii_new"
+  chmod 0644 "$_ii_new"
+  if mount --bind "$_ii_new" "$_ii_dst"; then
+    log "hook: input devices ignored by Android: $_ii_list"
+  else
+    log "hook: IGNORE_INPUT_DEVICES NOT applied (bind mount failed)"
+  fi
+}
+gbos_ignore_input_devices
 
 gbos_sensor_ueventd
 
