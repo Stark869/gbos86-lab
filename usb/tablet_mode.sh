@@ -200,30 +200,57 @@ tm_ext_keyboards() {
   ' "$TM_INPUT_DEVICES" 2>/dev/null
 }
 
-# A candidate counts as a keyboard once it has sent an event (a key typed): one background "getevent -qc 1" per candidate
+# A candidate counts as a keyboard once a letter key is pressed on it: one background "getevent -qc 1" loop per candidate
 # node; on success it leaves $TM_RUN/typed.eventN holding the candidate line, so a reused node number (another device)
 # does not match. A device that goes away ends its getevent with an error and leaves nothing.
 # The fields are split with cut/sed, never with a %%-pattern on the pipe sign: Android's mksh reads "|" in a pattern as "or", so that gave an
 # empty node and no watcher ever matched (boot 28, 2026-11-27: /dev/gbos-tablet/watch. in the avc lines).
 tm_kbd_ev() { printf '%s\n' "$1" | cut -d'|' -f1; }
 tm_kbd_name() { printf '%s\n' "$1" | sed 's/^[^|]*|[^|]*|//'; }
+# Only a letter key press counts (EV_KEY, value 1, KEY_Q..KEY_P / KEY_A..KEY_L / KEY_Z..KEY_M): the keyboard interface of a
+# wireless mouse's receiver sent some other event at 15:07 on boot 31 and kept the laptop in desktop mode. getevent -q
+# prints "TYPE CODE VALUE" in hex (a "device:" prefix, if any, is skipped by reading the last three fields). Three events
+# per getevent run: a USB key press comes as EV_MSC scan code + EV_KEY + SYN within microseconds, so a one-event run would
+# always see the scan code and miss the key behind it. Events between two runs are missed, the next key press is not.
+tm_is_letter_press() {
+  printf '%s\n' "$1" | awk '{
+    if (NF < 3) exit 1
+    t = $(NF - 2); c = $(NF - 1); v = $NF
+    if (t != "0001" || v != "00000001") exit 1
+    n = 0
+    for (i = 1; i <= length(c); i++) n = n * 16 + index("0123456789abcdef", tolower(substr(c, i, 1))) - 1
+    exit !((n >= 16 && n <= 25) || (n >= 30 && n <= 38) || (n >= 44 && n <= 50))
+  }'
+}
 tm_kbd_watch_one() {
   _wl=$1; _wev=$(tm_kbd_ev "$_wl")
-  if getevent -qc 1 "/dev/input/$_wev" > /dev/null 2>&1 && tm_ext_keyboards | grep -qxF "$_wl"; then
+  while _evs=$(getevent -qc 3 "/dev/input/$_wev" 2> /dev/null) && [ -n "$_evs" ]; do
+    tm_ext_keyboards | grep -qxF "$_wl" || break
+    _hit=
+    while IFS= read -r _ln; do tm_is_letter_press "$_ln" && _hit=1; done <<EOF
+$_evs
+EOF
+    [ -n "$_hit" ] || continue
     echo "$_wl" > "$TM_RUN/typed.$_wev"
-    tm_log "keyboard: typed on $_wev $(tm_kbd_name "$_wl"): counts as an external keyboard"
-  fi
+    tm_log "keyboard: letter key on $_wev $(tm_kbd_name "$_wl"): counts as an external keyboard"
+    break
+  done
   rm -f "$TM_RUN/watch.$_wev"
 }
 tm_kbd_watch() {
   [ "$TM_EXT_KEYBOARD" = desktop ] || return 0
-  tm_ext_keyboards | while IFS= read -r _l; do
+  _cands=$(tm_ext_keyboards)
+  [ -n "$_cands" ] || return 0
+  # A here-document, not a pipe: the watchers stay children of this shell (a pipe's subshell would orphan them).
+  while IFS= read -r _l; do
     _e=$(tm_kbd_ev "$_l"); [ -n "$_e" ] || continue
     [ "$(cat "$TM_RUN/typed.$_e" 2>/dev/null)" = "$_l" ] && continue
     [ "$(cat "$TM_RUN/watch.$_e" 2>/dev/null)" = "$_l" ] && continue
     echo "$_l" > "$TM_RUN/watch.$_e"
     tm_kbd_watch_one "$_l" &
-  done
+  done <<EOF
+$_cands
+EOF
 }
 # Names of the candidates that were typed on and are still plugged in.
 tm_typed_keyboards() {

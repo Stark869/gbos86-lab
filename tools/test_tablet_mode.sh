@@ -53,10 +53,18 @@ diff -u "$T/expected" "$T/switches"
 # boot); GETEVENT_PREFIX=1 also checks a "<device>: <bits>" form.
 GETEVENT_BITS=0002
 GETEVENT_PREFIX=0
-GETEVENT_TYPED=
+# -qc N NODE: the next N lines of $T/evq.<node> ("TYPE CODE VALUE" in hex as Android's getevent -q prints them, fewer if
+# the queue runs out); an empty or missing queue = the device went away (error). Lines queued together arrive together,
+# like a USB key press (scan code, key, SYN): a reader that takes one event per run sees only the scan codes.
+evq() { _q=$T/evq.$1; shift; printf '%s\n' "$@" > "$_q"; }
 getevent() {
-  # -qc 1 NODE: a key typed on NODE (listed in GETEVENT_TYPED) or the device went away (error).
-  if [ "$1 $2" = "-qc 1" ]; then case " $GETEVENT_TYPED " in *" $3 "*) echo "0001 001e 00000001"; return 0 ;; *) return 1 ;; esac; fi
+  case "$1" in -qc) _n=$2 ;; -qc[0-9]*) _n=${1#-qc}; set -- "$1" x "$2" ;; *) _n= ;; esac
+  if [ -n "$_n" ]; then
+    _q=$T/evq.${3##*/}
+    [ -s "$_q" ] || return 1
+    # A reader that restarts after each event misses the rest of a key press: with N=1 drop the 2 events that follow.
+    head -n "$_n" "$_q"; if [ "$_n" = 1 ]; then sed -i 1,3d "$_q"; else sed -i "1,${_n}d" "$_q"; fi; return 0
+  fi
   [ "$1" = -qS ] || return 1
   [ -n "$GETEVENT_BITS" ] || return 0
   if [ "$GETEVENT_PREFIX" = 1 ]; then printf '%s: %s\n' "$2" "$GETEVENT_BITS"; else printf '%s\n' "$GETEVENT_BITS"; fi
@@ -215,18 +223,23 @@ GETEVENT_BITS=0002; tm_apply_mode detach
 [ "$(cat "$T/run/mode")" = tablet ] && [ "$(cat "$T/ime.10")" = 1 ] || fail "no tablet mode before the keyboard"
 TM_INPUT_DEVICES=$T/devices-ext
 # Plugged in but nothing typed (a mouse receiver's keyboard interface looks the same): still tablet.
-GETEVENT_TYPED=; tm_kbd_watch; wait
+rm -f "$T"/evq.*; tm_kbd_watch; wait
 if tm_apply_mode "keyboard in"; then fail "desktop without a key typed"; fi
 [ "$(cat "$T/run/mode")" = tablet ] && [ ! -e "$T/ds.log" ] || fail "an untyped keyboard changed the mode"
 [ -z "$(ls "$T/run" | grep -E '^(watch|typed)\.')" ] || fail "watch/typed records left without a key: $(ls "$T/run")"
 # A key typed on the HP keyboard: desktop (the BT keyboard, never typed on, is not listed).
-GETEVENT_TYPED=/dev/input/event23; tm_kbd_watch; wait
+# Only a letter key press counts: on the HP keyboard a scan code (EV_MSC), a SYN, a letter release and a volume key come
+# first; on the BT keyboard (a mouse receiver's keyboard interface, boot 31) a mouse button, a media key and a space bar.
+evq event23 '0004 0004 00070004' '0001 001e 00000000' '0000 0000 00000000' '0004 0004 000700e9' '0001 0073 00000001' '0000 0000 00000000' \
+  '0004 0004 00070004' '0001 001e 00000001' '0000 0000 00000000'
+evq event26 '0001 0110 00000001' '0001 00a4 00000001' '0001 0039 00000001' '0001 0020 00000000'
+tm_kbd_watch; wait
 [ "$(cat "$T/run/typed.event23")" = 'event23||"HP USB Keyboard"' ] && [ ! -e "$T/run/typed.event26" ] || fail "typed record wrong: $(ls "$T/run")"
-grep -q 'keyboard: typed on event23 "HP USB Keyboard"' "$T/tablet-mode.txt" || fail "typing not logged"
+grep -q 'keyboard: letter key on event23 "HP USB Keyboard"' "$T/tablet-mode.txt" || fail "typing not logged"
 tm_apply_mode "keyboard in" || fail "keyboard plug-in not applied"
 [ "$(cat "$T/run/mode")" = desktop ] || fail "not desktop with an external keyboard"
 # Watching again does not start a second getevent for a typed keyboard.
-GETEVENT_TYPED=; tm_kbd_watch; wait
+rm -f "$T"/evq.*; tm_kbd_watch; wait
 [ -e "$T/run/typed.event23" ] || fail "typed record dropped by a later watch"
 [ "$(cat "$T/ds.log")" = 2 ] && [ -e "$T/run/override" ] || fail "desktop state not requested: $(cat "$T/ds.log" 2>/dev/null)"
 [ "$(cat "$T/ime.0")" = 0 ] && [ "$(cat "$T/ime.10")" = 0 ] || fail "on-screen keyboard setting not restored in desktop mode"
